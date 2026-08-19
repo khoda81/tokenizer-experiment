@@ -2,7 +2,7 @@
 
 Small controlled experiments comparing tokenizers by **block-prequential codelength in bits per raw UTF-8 byte**.
 
-The first experiment compares byte-level BPE with a prefix-free Tunstall-style byte phrase vocabulary using the same flat-softmax Transformer.
+The experiments compare byte-level BPE, prefix-free Tunstall-style byte phrases, and sparse-prefix ("Bunstall") tokenizers using the same flat-softmax Transformer.
 
 ## Layout
 
@@ -10,16 +10,21 @@ The first experiment compares byte-level BPE with a prefix-free Tunstall-style b
 src/tokenizer_experiment/
   model.py          reusable Transformer
   tunstall.py       BPE and Tunstall tokenizers
+  sparse_prefix.py  sparse-prefix / Bunstall tokenizer
   inspection.py     tokenizer structure diagnostics
   prequential.py    one-pass block-prequential evaluation
   experiment.py     reusable WikiText experiment orchestration
 
 scripts/
   run_experiment.py      runnable CLI + W&B integration
-  inspect_tokenizers.py  inspect learned tokens and branching structure
+  inspect_tokenizers.py  inspect BPE/Tunstall tokens and branching
+  inspect_bunstall.py    inspect sparse-prefix tokenizer variants
 
 docs/experiments/
   001-bpe-vs-tunstall-wikitext2.md
+  002-sparse-prefix-bunstall.md
+
+artifacts/               local generated outputs; gitignored
 
 tests/
 .github/workflows/ci.yml
@@ -34,7 +39,7 @@ uv sync --extra dev
 uv run python scripts/run_experiment.py
 ```
 
-W&B logging is enabled by default under project `tokenizer-experiment`. The run logs each prequential checkpoint live and stores a final table plus curves for cumulative bits/byte against both raw bytes and optimizer steps.
+W&B logging is enabled by default under project `tokenizer-experiment`. The run logs each prequential checkpoint live, stores comparison tables and curves, and logs the full result JSON as the versioned W&B Artifact `prequential-results`.
 
 Useful W&B options:
 
@@ -42,63 +47,83 @@ Useful W&B options:
 # Explicit project / run name
 uv run python scripts/run_experiment.py \
   --wandb-project tokenizer-experiment \
-  --wandb-run-name bpe-vs-tunstall-seed-1337
+  --wandb-run-name bunstall-uniformity-test
 
-# Keep W&B data local
+# Keep W&B data local for later syncing
 uv run python scripts/run_experiment.py --wandb-mode offline
 
-# Disable W&B entirely; results.json is still written
+# Disable W&B entirely; the local staged JSON is still written
 uv run python scripts/run_experiment.py --wandb-mode disabled
+```
+
+When the Hugging Face dataset is already cached and network access is flaky, skip Hub requests entirely:
+
+```bash
+HF_HUB_OFFLINE=1 uv run python scripts/run_experiment.py --wandb-mode offline
 ```
 
 ## Inspect the learned tokenizers
 
-The inspection run trains only the tokenizers, not the Transformer:
+Tokenizer-only inspections do not train the Transformer:
 
 ```bash
 uv run python scripts/inspect_tokenizers.py
+uv run python scripts/inspect_bunstall.py --mode entropy
+uv run python scripts/inspect_bunstall.py --mode frequency
 ```
 
-It prints and writes `tokenizer-inspection.json` containing:
+The BPE/Tunstall inspection logs the W&B Artifact `bpe-tunstall-inspection`. Bunstall inspections log `bunstall-entropy-inspection` or `bunstall-frequency-inspection`.
 
-- the most frequent emitted Tunstall and BPE tokens,
-- every expanded Tunstall prefix and its observed 256-way next-byte distribution,
-- the next-byte entropy and effective branching factor of each Tunstall expansion,
-- learned BPE merges viewed as approximate binary continuation tests `A+B` versus `A+[not B]`,
-- the binary entropy of those BPE splits and summary statistics over supported merges.
+Inspection output includes:
 
-This is intended to test the hypothesis that BPE spends one vocabulary slot at a time on sparse binary refinements while a byte-level Tunstall expansion spends 255 extra leaves at once.
+- the most frequent emitted tokens, with visible whitespace glyphs,
+- expanded Tunstall prefixes and their observed 256-way continuation distributions,
+- next-byte entropy and effective branching factor,
+- learned BPE merges viewed as approximate binary continuation tests,
+- Bunstall promoted continuations and their binary split statistics.
+
+This tests the hypothesis that BPE and sparse-prefix tokenizers can spend one vocabulary slot at a time on useful refinements while a byte-level Tunstall expansion must spend 255 extra leaves at once.
 
 ## Default experiment
 
 - WikiText-2 raw.
-- First 2 MB fit both tokenizers and are treated as shared side information.
+- First 2 MB fit the tokenizers and are treated as shared side information.
 - All remaining train bytes form the candidate prequential stream.
 - Requested vocabulary ~4096; the byte-only Tunstall tree plus separate EOS snaps this to 4082.
 - Checkpoints: `1%, 2%, 4%, 8%, 16%, 32%, 64%, 100%`.
-- Same 4-layer, 256-wide Transformer for both tokenizers.
+- Same 4-layer, 256-wide Transformer for every tokenizer.
 - Context 256 tokens.
 - Each observed prefix is trained from scratch for **exactly one pass**. There is no epoch parameter.
 - First block uses a uniform token code; later blocks use causal NLL from the model trained on the preceding raw-byte prefix.
 
-Tunstall-safe boundaries are used for both tokenizers so every scored block contains exactly the same raw bytes.
+The current experiment preserves the original Tunstall-safe raw-byte checkpoint policy for comparability with Experiment 001.
 
-## Outputs
+## Outputs and W&B Artifacts
 
-`results.json` is the machine-readable source of truth for each run. It contains metadata, stage records, final prequential code, and a compact `code_curve` containing:
+Generated local state is staged under `artifacts/`, which is gitignored:
+
+```text
+artifacts/
+  results.json
+  tokenizer-inspection.json
+  bunstall-inspection.json
+  wandb/
+```
+
+The local JSON files are useful for immediate inspection, but **W&B Artifacts are the persistent experiment record**. Repeated logs of the same artifact collection create versioned outputs associated with their producing runs.
+
+`prequential-results` contains the machine-readable experiment result with metadata, stage records, final prequential code, and a compact `code_curve` containing:
 
 - raw bytes encoded,
 - cumulative bits and bits/byte,
 - training bytes and tokens,
 - per-model optimizer steps,
-- cumulative optimizer steps,
+- cumulative retraining work,
 - cumulative train + score wall time.
-
-W&B mirrors this trace for interactive comparisons; it does not replace the JSON result.
 
 ## Experiments
 
-See [`docs/experiments/001-bpe-vs-tunstall-wikitext2.md`](docs/experiments/001-bpe-vs-tunstall-wikitext2.md) for the first recorded run and its stage-by-stage results.
+See `docs/experiments/` for recorded hypotheses, setups, and results.
 
 ## CI
 
