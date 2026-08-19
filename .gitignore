@@ -1,6 +1,12 @@
 .venv/
 __pycache__/
 .pytest_cache/
+
+# Generated experiment outputs and local tracking state.
+artifacts/
+
+# Legacy root-level outputs from earlier runs.
 wandb/
 results*.json
 tokenizer-inspection*.json
+bunstall-inspection*.json
