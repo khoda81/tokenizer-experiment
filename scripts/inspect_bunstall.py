@@ -7,9 +7,9 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
-import wandb
 from datasets import load_dataset
 
+import wandb
 from tokenizer_experiment.data import mb, split_tokenizer_fit
 from tokenizer_experiment.experiment import tokenizer_stats
 from tokenizer_experiment.inspection import display_bytes

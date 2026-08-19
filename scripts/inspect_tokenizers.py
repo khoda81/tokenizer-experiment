@@ -4,10 +4,10 @@ import argparse
 import json
 from pathlib import Path
 
-import wandb
 from datasets import load_dataset
 
-from tokenizer_experiment.experiment import mb, split_tokenizer_fit
+import wandb
+from tokenizer_experiment.data import mb, split_tokenizer_fit
 from tokenizer_experiment.inspection import (
     bpe_merge_split_rows,
     emitted_token_rows,
