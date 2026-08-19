@@ -22,7 +22,7 @@ class ExperimentConfig:
     dataset_config: str = "wikitext-2-raw-v1"
     vocab_size: int = 4096
     tunstall_mode: str = "boundary"
-    bunstall_modes: tuple[str, ...] = ("entropy", "frequency")
+    bunstall_modes: tuple[str, ...] = ("frequency", "entropy")
     tokenizer_fit_mb: float = 2.0
     max_preq_mb: float = 0.0
     context: int = 256
@@ -216,10 +216,13 @@ def run_experiment(
             f"max phrase={tokenizer.max_phrase_bytes()} bytes"
         )
 
+    # Experimental/new tokenizers intentionally run first. Baselines come last
+    # so a clearly bad new idea can be stopped early without re-running known
+    # controls before we have learned anything new.
     tokenizers: list[tuple[str, Any]] = [
+        *[(f"bunstall-{mode}", bunstalls[mode]) for mode in config.bunstall_modes],
         ("bpe", bpe),
         (f"tunstall-{config.tunstall_mode}", tunstall),
-        *[(f"bunstall-{mode}", bunstalls[mode]) for mode in config.bunstall_modes],
     ]
 
     print("\nTokenizer diagnostics on the actual online datums:")
@@ -274,6 +277,7 @@ def run_experiment(
         "eos_is_separate_token": True,
         "tunstall_mode": config.tunstall_mode,
         "bunstall_modes": list(config.bunstall_modes),
+        "evaluation_order": [name for name, _ in tokenizers],
         "tokenizer_fit_bytes": len(fit_raw),
         "candidate_prequential_rows": len(preq_rows),
         "online_datums": len(datums),
