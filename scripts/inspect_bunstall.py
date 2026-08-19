@@ -140,7 +140,8 @@ def main() -> None:
         f"max phrase={tokenizer.max_phrase_bytes()} bytes"
     )
 
-    stats = tokenizer_stats(tokenizer, [fit_raw])
+    fit_ids = tokenizer.encode_bytes(fit_raw)
+    stats = tokenizer_stats(tokenizer, fit_ids, len(fit_raw))
     print("\nTokenizer diagnostics on fit corpus")
     print(f"  bytes/token:       {stats['bytes_per_token']:.3f}")
     print(f"  H(T)/log2(V):      {stats['entropy_fraction_of_uniform']:.4f}")
@@ -198,14 +199,12 @@ def main() -> None:
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
-    wandb_dir = ARTIFACTS_DIR / "wandb"
-    wandb_dir.mkdir(parents=True, exist_ok=True)
     with wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
         name=args.wandb_run_name,
         mode=args.wandb_mode,
-        dir=str(wandb_dir),
+        dir=str(ARTIFACTS_DIR),
         job_type="tokenizer-inspection",
         config={
             "dataset_config": args.dataset_config,
