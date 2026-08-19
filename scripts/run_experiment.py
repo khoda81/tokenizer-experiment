@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--bunstall-modes",
         type=parse_bunstall_modes,
-        default=parse_bunstall_modes("entropy,frequency"),
+        default=parse_bunstall_modes("frequency,entropy"),
         help="Comma-separated Bunstall modes to include; empty string disables Bunstall.",
     )
     p.add_argument("--tokenizer-fit-mb", type=float, default=2.0)
@@ -100,8 +100,6 @@ def main() -> None:
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    wandb_dir = ARTIFACTS_DIR / "wandb"
-    wandb_dir.mkdir(parents=True, exist_ok=True)
 
     curve_rows: list[list[object]] = []
     columns = [
@@ -123,7 +121,8 @@ def main() -> None:
         entity=args.wandb_entity,
         name=args.wandb_run_name,
         mode=args.wandb_mode,
-        dir=str(wandb_dir),
+        # W&B itself creates a `wandb/` child under this directory.
+        dir=str(ARTIFACTS_DIR),
         config=asdict(config),
         save_code=True,
         tags=["online-prequential", "tokenization", config.tunstall_mode, "bunstall"],
