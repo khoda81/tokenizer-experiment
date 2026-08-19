@@ -63,3 +63,17 @@ def test_unaligned_finite_message_requires_boundary_alignment():
             break
     else:
         pytest.skip("constructed tree happened to align every tested prefix")
+
+
+def test_aligned_prequential_cuts_make_every_block_independently_encodable():
+    data = (("the λ quick brown fox\n" * 200).encode())
+    tok = EmpiricalTunstallTokenizer.train(data, 4096, mode="boundary")
+    cuts = tok.align_utf8_boundaries(data, [0.1, 0.25, 0.5, 1.0])
+
+    start = 0
+    for end in cuts:
+        block = data[start:end]
+        assert block.decode("utf-8").encode("utf-8") == block
+        ids = tok.encode_bytes(block)
+        assert tok.decode_bytes(ids) == block
+        start = end
