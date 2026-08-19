@@ -22,6 +22,24 @@ class RecordingBiasModel(nn.Module):
         return self.bias.view(1, 1, -1).expand(batch, time, -1)
 
 
+class NextTokenModel(nn.Module):
+    """Predict token x+1 from input token x, exposing alignment mistakes."""
+
+    def __init__(self, vocab_size: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.dummy = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        predicted = (ids + 1) % self.vocab_size
+        logits = torch.zeros(
+            *ids.shape, self.vocab_size, dtype=torch.float32, device=ids.device
+        )
+        logits.scatter_(-1, predicted[..., None], 10.0)
+        # Keep a parameter in the graph so the normal backward/update path runs.
+        return logits + self.dummy * 0.0
+
+
 class CountingSGD(torch.optim.SGD):
     def __init__(self, params, lr: float):
         super().__init__(params, lr=lr)
@@ -68,6 +86,32 @@ def test_stream_update_scores_before_one_step_and_keeps_prior_context():
     # shorter than the model context.
     assert model.inputs[0] == [16, 1]
     assert model.inputs[1] == [16, 1, 2, 3]
+
+
+def test_stream_targets_are_aligned_with_the_immediately_previous_token():
+    # BOS=0 predicts 1, then 1 predicts 2, ..., so the correctly shifted stream
+    # should receive the model's high-probability class at every target. This
+    # catches an off-by-one even though the uniform-bias tests cannot.
+    vocab_size = 8
+    ids = [1, 2, 3, 4, 5, 6]
+    model = NextTokenModel(vocab_size)
+    optimizer = CountingSGD(model.parameters(), lr=0.0)
+
+    bits = _stream_update_step(
+        model,
+        optimizer,
+        ids,
+        start_token=0,
+        end_token=len(ids),
+        bos_id=0,
+        context=4,
+        device=torch.device("cpu"),
+    )
+
+    correct_nats = math.log(math.exp(10.0) + vocab_size - 1) - 10.0
+    expected_bits = len(ids) * correct_nats / math.log(2.0)
+    assert bits == pytest.approx(expected_bits, rel=1e-4, abs=1e-6)
+    assert optimizer.step_calls == 1
 
 
 def test_large_update_accumulates_chunks_before_single_step():
