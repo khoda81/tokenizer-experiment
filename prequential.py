@@ -98,6 +98,14 @@ class CausalTransformer(nn.Module):
         self.transformer = nn.TransformerEncoder(layer, num_layers=cfg.n_layers)
         self.norm = nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, vocab_size, bias=False)
+
+        # nn.Embedding defaults to N(0, 1). That is disastrous when its weight is
+        # reused as the output projection: after LayerNorm the initial logits have
+        # enormous variance and the untrained model is confidently random. Use the
+        # small embedding initialization common in decoder-only Transformers before
+        # tying input and output weights.
+        nn.init.normal_(self.token.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.pos.weight, mean=0.0, std=0.02)
         self.head.weight = self.token.weight
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
