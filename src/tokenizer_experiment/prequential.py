@@ -138,8 +138,14 @@ def score_model(
     device: torch.device,
     batch_size: int,
 ) -> tuple[float, float]:
-    if len(ids) < 2:
+    if not ids:
         return 0.0, 0.0
+
+    # The first token of an independently encoded block has no model context.
+    total_bits = math.log2(model.vocab_size)
+    if len(ids) == 1:
+        return total_bits, 0.0
+
     model.eval()
     ds = TokenWindows(ids, context)
     loader = DataLoader(
@@ -149,9 +155,6 @@ def score_model(
         collate_fn=collate_windows,
         pin_memory=device.type == "cuda",
     )
-    # Blocks are cut at token boundaries, but the model is not given context
-    # from the previous block. Send the first token under a uniform code.
-    total_bits = math.log2(model.vocab_size)
     nats = 0.0
     start_time = time.perf_counter()
     for x, y in tqdm(loader, desc="score", leave=False):
