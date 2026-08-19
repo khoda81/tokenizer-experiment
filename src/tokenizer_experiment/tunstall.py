@@ -10,7 +10,6 @@ from typing import Literal
 import numpy as np
 
 BYTE_ALPHABET = 256
-EOS_TOKEN = 256  # conceptual symbol only; EOS is not a Tunstall-tree branch
 
 
 @dataclass
