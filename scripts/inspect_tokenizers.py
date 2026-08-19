@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+import wandb
 from datasets import load_dataset
 
 from tokenizer_experiment.experiment import mb, split_tokenizer_fit
@@ -14,6 +15,8 @@ from tokenizer_experiment.inspection import (
     tunstall_split_rows,
 )
 from tokenizer_experiment.tunstall import BPETokenizer, EmpiricalTunstallTokenizer
+
+ARTIFACTS_DIR = Path("artifacts")
 
 
 def print_token_rows(name: str, rows: list[dict], top_n: int) -> None:
@@ -84,7 +87,17 @@ def main() -> None:
     )
     parser.add_argument("--top", type=int, default=30)
     parser.add_argument("--min-bpe-support", type=int, default=100)
-    parser.add_argument("--output", default="tokenizer-inspection.json")
+    parser.add_argument(
+        "--output", default=str(ARTIFACTS_DIR / "tokenizer-inspection.json")
+    )
+    parser.add_argument("--wandb-project", default="tokenizer-experiment")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument(
+        "--wandb-mode",
+        choices=["online", "offline", "disabled"],
+        default="online",
+    )
     args = parser.parse_args()
 
     print(f"Loading Salesforce/wikitext / {args.dataset_config} ...")
@@ -105,8 +118,6 @@ def main() -> None:
     print("Training BPE tokenizer ...")
     bpe = BPETokenizer.train(fit_text, vocab_size=actual_vocab)
 
-    # Use the longest prefix that is a complete Tunstall phrase so token counts
-    # from both vocabularies refer to exactly the same bytes.
     inspect_end = tunstall.align_utf8_boundaries(fit_raw, [1.0])[0]
     inspect_raw = fit_raw[:inspect_end]
     print(
@@ -156,8 +167,46 @@ def main() -> None:
             ),
         },
     }
-    Path(args.output).write_text(json.dumps(payload, indent=2))
-    print(f"\nWrote {args.output}")
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    wandb_dir = ARTIFACTS_DIR / "wandb"
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+    with wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        mode=args.wandb_mode,
+        dir=str(wandb_dir),
+        job_type="tokenizer-inspection",
+        config={
+            "dataset_config": args.dataset_config,
+            "vocab_size": actual_vocab,
+            "tokenizer_fit_mb": args.tokenizer_fit_mb,
+            "tunstall_mode": args.tunstall_mode,
+            "min_bpe_support": args.min_bpe_support,
+        },
+        tags=["tokenizer-inspection", "bpe", "tunstall"],
+    ) as run:
+        run.log({f"bpe_split/{key}": value for key, value in bpe_summary.items()})
+        artifact = wandb.Artifact(
+            name="bpe-tunstall-inspection",
+            type="tokenizer-inspection",
+            metadata={
+                "tunstall_mode": args.tunstall_mode,
+                "vocab_size": actual_vocab,
+                "fit_bytes": len(inspect_raw),
+            },
+        )
+        artifact.add_file(str(output_path), name="inspection.json")
+        run.log_artifact(artifact)
+
+    print(
+        f"\nWrote {output_path} and logged W&B artifact bpe-tunstall-inspection"
+    )
 
 
 if __name__ == "__main__":
