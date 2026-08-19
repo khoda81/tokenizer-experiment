@@ -1,6 +1,6 @@
 import pytest
 
-from tunstall import EmpiricalTunstallTokenizer
+from tokenizer_experiment.tunstall import EmpiricalTunstallTokenizer
 
 
 def aligned_prefix(tok: EmpiricalTunstallTokenizer, data: bytes) -> bytes:
