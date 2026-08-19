@@ -31,7 +31,7 @@ class CountingSGD(torch.optim.SGD):
         return super().step(closure)
 
 
-def test_online_datum_scores_before_one_update_across_context_chunks():
+def test_online_datum_scores_content_before_one_update_across_context_chunks():
     vocab_size = 17
     model = BiasOnlyModel(vocab_size)
     optimizer = CountingSGD(model.parameters(), lr=0.1)
@@ -41,34 +41,33 @@ def test_online_datum_scores_before_one_update_across_context_chunks():
         model,
         optimizer,
         ids,
-        eos_id=16,
+        bos_id=16,
         context=3,
         device=torch.device("cpu"),
     )
 
-    # Content tokens plus one EOS termination target are all scored while the
-    # model is still uniform, even though the datum spans several context chunks.
-    assert bits == pytest.approx((len(ids) + 1) * math.log2(vocab_size), rel=1e-6)
+    # Every content token is scored while the model is still uniform. The known
+    # datum boundary is not charged as a synthetic EOS target.
+    assert bits == pytest.approx(len(ids) * math.log2(vocab_size), rel=1e-6)
     assert optimizer.step_calls == 1
     assert not torch.allclose(model.bias, torch.zeros_like(model.bias))
 
 
-def test_empty_content_datum_still_predicts_eos_once():
-    vocab_size = 7
-    model = BiasOnlyModel(vocab_size)
+def test_empty_content_datum_is_rejected():
+    model = BiasOnlyModel(7)
     optimizer = CountingSGD(model.parameters(), lr=0.1)
 
-    bits = _online_datum_step(
-        model,
-        optimizer,
-        [],
-        eos_id=6,
-        context=4,
-        device=torch.device("cpu"),
-    )
+    with pytest.raises(ValueError, match="at least one token"):
+        _online_datum_step(
+            model,
+            optimizer,
+            [],
+            bos_id=6,
+            context=4,
+            device=torch.device("cpu"),
+        )
 
-    assert bits == pytest.approx(math.log2(vocab_size), rel=1e-6)
-    assert optimizer.step_calls == 1
+    assert optimizer.step_calls == 0
 
 
 def test_tunstall_row_grouping_closes_at_every_earliest_legal_boundary():
