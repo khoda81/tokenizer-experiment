@@ -85,7 +85,7 @@ class TinyGPT(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        b, t = ids.shape
+        _b, t = ids.shape
         if t > self.context:
             raise ValueError(f"sequence length {t} exceeds context {self.context}")
         pos = torch.arange(t, device=ids.device)

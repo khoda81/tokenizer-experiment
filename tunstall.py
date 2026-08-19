@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import itertools
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -277,7 +278,7 @@ class EmpiricalTunstallTokenizer:
 
     def assert_prefix_free(self) -> None:
         phrases = sorted(self._id_to_phrase)
-        for a, b in zip(phrases, phrases[1:]):
+        for a, b in itertools.pairwise(phrases, phrases[1:]):
             if len(a) <= len(b) and b[: len(a)] == a:
                 raise AssertionError(f"not prefix-free: {a} prefixes {b}")
 

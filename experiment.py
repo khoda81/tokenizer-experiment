@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import platform
@@ -76,7 +77,7 @@ def parse_fractions(value: str) -> list[float]:
     vals = [float(x) for x in value.split(",") if x.strip()]
     if not vals or vals[-1] != 1.0:
         raise argparse.ArgumentTypeError("fractions must end in 1.0")
-    if vals[0] <= 0 or any(a >= b for a, b in zip(vals, vals[1:])):
+    if vals[0] <= 0 or any(a >= b for a, b in itertools.pairwise(vals, vals[1:])):
         raise argparse.ArgumentTypeError("fractions must be increasing in (0, 1]")
     return vals
 

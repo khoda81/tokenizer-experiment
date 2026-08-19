@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import math
 import random
 import time
@@ -207,7 +208,7 @@ def safe_utf8_boundaries(raw: bytes, fractions: list[float]) -> list[int]:
     out: list[int] = []
     prev = 0
     for frac in fractions:
-        n = len(raw) if frac >= 1.0 else int(round(len(raw) * frac))
+        n = len(raw) if frac >= 1.0 else round(len(raw) * frac)
         while n > prev:
             try:
                 raw[prev:n].decode("utf-8")
@@ -237,7 +238,7 @@ def run_block_prequential(
 ) -> dict:
     if not fractions or fractions[-1] != 1.0:
         raise ValueError("fractions must end in 1.0")
-    if any(a >= b for a, b in zip(fractions, fractions[1:])):
+    if any(a >= b for a, b in itertools.pairwise(fractions, fractions[1:])):
         raise ValueError("fractions must be strictly increasing")
 
     boundaries = safe_utf8_boundaries(raw, fractions)
