@@ -21,9 +21,16 @@ def parse_bunstall_modes(value: str) -> tuple[str, ...]:
     return modes
 
 
+def atomic_write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Compare tokenizer families by true online prequential codelength."
+        description="Compare tokenizer families by continuous-stream prequential codelength."
     )
     p.add_argument("--dataset-config", default="wikitext-2-raw-v1")
     p.add_argument("--vocab-size", type=int, default=4096)
@@ -38,6 +45,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--tokenizer-fit-mb", type=float, default=2.0)
     p.add_argument("--max-preq-mb", type=float, default=0.0)
+    p.add_argument(
+        "--update-bytes",
+        type=int,
+        default=256,
+        help=(
+            "Target raw bytes between optimizer updates. Actual updates move to the "
+            "nearest following raw-byte position that is a token boundary for every tokenizer."
+        ),
+    )
     p.add_argument("--context", type=int, default=256)
     p.add_argument("--d-model", type=int, default=256)
     p.add_argument("--layers", type=int, default=4)
@@ -56,10 +72,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-every",
         type=int,
         default=100,
-        help="Log telemetry every N datums; does not affect training or coding.",
+        help="Log/checkpoint telemetry every N optimizer updates; does not affect coding.",
     )
     p.add_argument("--device", default=None)
     p.add_argument("--output", default=str(ARTIFACTS_DIR / "results.json"))
+    p.add_argument(
+        "--partial-output", default=str(ARTIFACTS_DIR / "results.partial.json")
+    )
 
     p.add_argument("--wandb-project", default="tokenizer-experiment")
     p.add_argument("--wandb-entity", default=None)
@@ -82,6 +101,7 @@ def main() -> None:
         "bunstall_modes": args.bunstall_modes,
         "tokenizer_fit_mb": args.tokenizer_fit_mb,
         "max_preq_mb": args.max_preq_mb,
+        "update_bytes": args.update_bytes,
         "context": args.context,
         "d_model": args.d_model,
         "layers": args.layers,
@@ -99,22 +119,29 @@ def main() -> None:
 
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     output_path = Path(args.output)
+    partial_path = Path(args.partial_output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     curve_rows: list[list[object]] = []
     columns = [
         "model",
-        "datum",
+        "update",
         "raw_bytes",
         "cumulative_tokens",
         "cumulative_bits",
         "bits_per_byte",
-        "datum_bytes",
-        "datum_tokens",
-        "datum_bits_per_byte",
+        "update_bytes",
+        "update_tokens",
+        "update_bits_per_byte",
         "optimizer_steps",
         "elapsed_seconds",
     ]
+    partial_state: dict[str, object] = {
+        "status": "starting",
+        "config": asdict(config),
+        "models": {},
+    }
+    atomic_write_json(partial_path, partial_state)
 
     with wandb.init(
         project=args.wandb_project,
@@ -125,55 +152,78 @@ def main() -> None:
         dir=str(ARTIFACTS_DIR),
         config=asdict(config),
         save_code=True,
-        tags=["online-prequential", "tokenization", config.tunstall_mode, "bunstall"],
+        tags=["continuous-prequential", "tokenization", config.tunstall_mode, "bunstall"],
     ) as run:
 
         def on_progress(model_name: str, point: dict) -> None:
             key = model_name.replace("-", "_")
             row = [
                 model_name,
-                point["datum"],
+                point["update"],
                 point["cumulative_bytes"],
                 point["cumulative_tokens"],
                 point["cumulative_bits"],
                 point["cumulative_bits_per_byte"],
-                point["datum_bytes"],
-                point["datum_tokens"],
-                point["datum_bits_per_byte"],
+                point["update_bytes"],
+                point["update_tokens"],
+                point["update_bits_per_byte"],
                 point["optimizer_steps"],
                 point["elapsed_seconds"],
             ]
             curve_rows.append(row)
+
+            models = partial_state["models"]
+            assert isinstance(models, dict)
+            model_state = models.setdefault(model_name, {"code_curve": []})
+            model_state["latest"] = point
+            model_state["code_curve"].append(point)
+            partial_state["status"] = "running"
+            partial_state["current_model"] = model_name
+            atomic_write_json(partial_path, partial_state)
+
             run.log(
                 {
-                    f"{key}/datum": point["datum"],
+                    f"{key}/update": point["update"],
                     f"{key}/raw_bytes": point["cumulative_bytes"],
                     f"{key}/cumulative_tokens": point["cumulative_tokens"],
                     f"{key}/cumulative_bits": point["cumulative_bits"],
                     f"{key}/cumulative_bits_per_byte": point[
                         "cumulative_bits_per_byte"
                     ],
-                    f"{key}/datum_bits_per_byte": point["datum_bits_per_byte"],
+                    f"{key}/update_bits_per_byte": point["update_bits_per_byte"],
                     f"{key}/optimizer_steps": point["optimizer_steps"],
                 }
             )
 
-        payload = run_experiment(config, on_progress=on_progress)
-        output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        try:
+            payload = run_experiment(config, on_progress=on_progress)
+        except BaseException as exc:
+            partial_state["status"] = "interrupted"
+            partial_state["error_type"] = type(exc).__name__
+            partial_state["error"] = str(exc)
+            atomic_write_json(partial_path, partial_state)
+            raise
+
+        atomic_write_json(output_path, payload)
+        partial_state["status"] = "complete"
+        partial_state["final_output"] = str(output_path)
+        atomic_write_json(partial_path, partial_state)
 
         results_artifact = wandb.Artifact(
             name="prequential-results",
             type="experiment-results",
-            description="True online prequential tokenizer comparison results.",
+            description="Continuous-stream online prequential tokenizer comparison results.",
             metadata={
-                "protocol": "online-prequential",
+                "protocol": "continuous-stream-online-prequential",
                 "dataset_config": config.dataset_config,
                 "vocab_size": payload["metadata"]["actual_vocab_size"],
                 "seed": config.seed,
                 "lr": config.lr,
+                "update_target_bytes": config.update_bytes,
             },
         )
         results_artifact.add_file(str(output_path), name="results.json")
+        results_artifact.add_file(str(partial_path), name="results.partial.json")
         run.log_artifact(results_artifact)
 
         table = wandb.Table(columns=columns, data=curve_rows)
@@ -185,14 +235,14 @@ def main() -> None:
                     x="raw_bytes",
                     y="bits_per_byte",
                     stroke="model",
-                    title="Online prequential bits / raw byte",
+                    title="Continuous prequential bits / raw byte",
                 ),
                 "code_curve/by_optimizer_steps": wandb.plot.line(
                     table,
                     x="optimizer_steps",
                     y="bits_per_byte",
                     stroke="model",
-                    title="Online prequential code vs optimizer steps",
+                    title="Continuous prequential code vs optimizer steps",
                 ),
             }
         )
@@ -212,7 +262,7 @@ def main() -> None:
         bpb = result["prequential_bits_per_byte"]
         suffix = "" if result["name"] == "bpe" else f"  ({bpb - bpe_bpb:+.6f} vs BPE)"
         print(f"  {result['name']:20s} {bpb:.6f} bits/byte{suffix}")
-    print(f"\nWrote {output_path} and logged W&B artifact prequential-results")
+    print(f"\nWrote {output_path}; live checkpoint is {partial_path}")
 
 
 if __name__ == "__main__":
