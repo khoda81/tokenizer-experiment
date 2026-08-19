@@ -6,6 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import wandb
+
 from tokenizer_experiment import ExperimentConfig, run_experiment
 
 ARTIFACTS_DIR = Path("artifacts")
