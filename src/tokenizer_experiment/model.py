@@ -39,7 +39,12 @@ class CausalTransformer(nn.Module):
             norm_first=True,
             activation="gelu",
         )
-        self.transformer = nn.TransformerEncoder(layer, num_layers=cfg.n_layers)
+        # norm_first=True makes PyTorch disable the nested-tensor fast path
+        # anyway. Set this explicitly so constructing each prequential model
+        # does not emit the same warning while preserving the baseline model.
+        self.transformer = nn.TransformerEncoder(
+            layer, num_layers=cfg.n_layers, enable_nested_tensor=False
+        )
         self.norm = nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, vocab_size, bias=False)
 
