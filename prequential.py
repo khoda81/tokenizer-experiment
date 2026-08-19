@@ -27,15 +27,14 @@ class ModelConfig:
 @dataclass(frozen=True)
 class TrainConfig:
     batch_size: int = 16
-    epochs: int = 1
     lr: float = 3e-4
     weight_decay: float = 0.1
-    max_train_steps: int = 0
     seed: int = 1337
 
 
 @dataclass
 class StageResult:
+    stage: int
     train_fraction: float
     eval_fraction_end: float
     train_bytes: int
@@ -47,6 +46,11 @@ class StageResult:
     train_seconds: float
     eval_seconds: float
     optimizer_steps: int
+    cumulative_bytes: int
+    cumulative_bits: float
+    cumulative_bits_per_byte: float
+    cumulative_optimizer_steps: int
+    cumulative_seconds: float
 
 
 class TokenWindows(Dataset):
@@ -142,6 +146,7 @@ def train_model(
     train_cfg: TrainConfig,
     device: torch.device,
 ) -> tuple[CausalTransformer, int, float]:
+    """Train a fresh model for exactly one pass over the observed prefix."""
     set_seed(train_cfg.seed)
     model = CausalTransformer(vocab_size, model_cfg).to(device)
     ds = TokenWindows(ids, model_cfg.context)
@@ -159,21 +164,18 @@ def train_model(
     model.train()
     steps = 0
     start_time = time.perf_counter()
-    for _ in range(train_cfg.epochs):
-        for x, y in tqdm(loader, desc="train", leave=False):
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            with autocast_context(device):
-                logits = model(x)
-                loss = F.cross_entropy(
-                    logits.reshape(-1, vocab_size), y.reshape(-1), ignore_index=-100
-                )
-            loss.backward()
-            optimizer.step()
-            steps += 1
-            if train_cfg.max_train_steps and steps >= train_cfg.max_train_steps:
-                return model, steps, time.perf_counter() - start_time
+    for x, y in tqdm(loader, desc="train", leave=False):
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast_context(device):
+            logits = model(x)
+            loss = F.cross_entropy(
+                logits.reshape(-1, vocab_size), y.reshape(-1), ignore_index=-100
+            )
+        loss.backward()
+        optimizer.step()
+        steps += 1
     return model, steps, time.perf_counter() - start_time
 
 
@@ -265,6 +267,7 @@ def run_block_prequential(
     first_ids = tokenizer.encode(first)
     initial_bits = len(first_ids) * math.log2(vocab)
     initial = StageResult(
+        stage=0,
         train_fraction=0.0,
         eval_fraction_end=actual_fractions[0],
         train_bytes=0,
@@ -276,8 +279,16 @@ def run_block_prequential(
         train_seconds=0.0,
         eval_seconds=0.0,
         optimizer_steps=0,
+        cumulative_bytes=boundaries[0],
+        cumulative_bits=initial_bits,
+        cumulative_bits_per_byte=initial_bits / boundaries[0],
+        cumulative_optimizer_steps=0,
+        cumulative_seconds=0.0,
     )
     stages = [initial]
+    cumulative_bits = initial_bits
+    cumulative_steps = 0
+    cumulative_seconds = 0.0
     print(f"[{name}] uniform block: {initial.bits_per_byte:.4f} bits/byte")
 
     for i in range(len(boundaries) - 1):
@@ -307,31 +318,59 @@ def run_block_prequential(
             device,
             train_cfg.batch_size,
         )
-        stages.append(
-            StageResult(
-                train_fraction=actual_fractions[i],
-                eval_fraction_end=actual_fractions[i + 1],
-                train_bytes=train_end,
-                eval_bytes=eval_end - train_end,
-                train_tokens=len(train_ids),
-                eval_tokens=len(eval_ids),
-                bits=bits,
-                bits_per_byte=bits / (eval_end - train_end),
-                train_seconds=train_seconds,
-                eval_seconds=eval_seconds,
-                optimizer_steps=steps,
-            )
+
+        cumulative_bits += bits
+        cumulative_steps += steps
+        cumulative_seconds += train_seconds + eval_seconds
+        stage = StageResult(
+            stage=i + 1,
+            train_fraction=actual_fractions[i],
+            eval_fraction_end=actual_fractions[i + 1],
+            train_bytes=train_end,
+            eval_bytes=eval_end - train_end,
+            train_tokens=len(train_ids),
+            eval_tokens=len(eval_ids),
+            bits=bits,
+            bits_per_byte=bits / (eval_end - train_end),
+            train_seconds=train_seconds,
+            eval_seconds=eval_seconds,
+            optimizer_steps=steps,
+            cumulative_bytes=eval_end,
+            cumulative_bits=cumulative_bits,
+            cumulative_bits_per_byte=cumulative_bits / eval_end,
+            cumulative_optimizer_steps=cumulative_steps,
+            cumulative_seconds=cumulative_seconds,
         )
+        stages.append(stage)
         print(
-            f"[{name}]   {bits / (eval_end - train_end):.4f} bits/byte; "
-            f"train {train_seconds:.1f}s; score {eval_seconds:.1f}s"
+            f"[{name}]   block={stage.bits_per_byte:.4f} bits/byte; "
+            f"cumulative={stage.cumulative_bits_per_byte:.4f}; "
+            f"steps={steps:,}; train {train_seconds:.1f}s; score {eval_seconds:.1f}s"
         )
 
-    total_bits = sum(s.bits for s in stages)
-    result = {
+    # `code_curve` is deliberately redundant with `stages`: it is a stable,
+    # compact plotting interface for comparing prequential code against data,
+    # optimizer work, or elapsed training/scoring time without rerunning.
+    code_curve = [
+        {
+            "stage": s.stage,
+            "raw_bytes": s.cumulative_bytes,
+            "fraction": s.eval_fraction_end,
+            "cumulative_bits": s.cumulative_bits,
+            "bits_per_byte": s.cumulative_bits_per_byte,
+            "model_train_bytes": s.train_bytes,
+            "model_train_tokens": s.train_tokens,
+            "model_optimizer_steps": s.optimizer_steps,
+            "cumulative_optimizer_steps": s.cumulative_optimizer_steps,
+            "cumulative_seconds": s.cumulative_seconds,
+        }
+        for s in stages
+    ]
+
+    return {
         "name": name,
-        "prequential_bits": total_bits,
-        "prequential_bits_per_byte": total_bits / len(raw),
+        "prequential_bits": cumulative_bits,
+        "prequential_bits_per_byte": cumulative_bits / len(raw),
         "stages": [s.__dict__ for s in stages],
+        "code_curve": code_curve,
     }
-    return result
