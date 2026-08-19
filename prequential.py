@@ -4,42 +4,17 @@ import itertools
 import math
 import random
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 import numpy as np
 import torch
-from torch.nn import functional as F
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
-
-from model import TinyGPT
+from tqdm.auto import tqdm
 
 
-class TokenWindows(Dataset):
-    def __init__(self, ids: list[int], context: int):
-        self.ids = torch.tensor(ids, dtype=torch.long)
-        self.context = context
-        self.n = max(0, math.ceil((len(ids) - 1) / context))
-
-    def __len__(self) -> int:
-        return self.n
-
-    def __getitem__(self, i: int):
-        start = i * self.context
-        chunk = self.ids[start : start + self.context + 1]
-        x = chunk[:-1]
-        y = chunk[1:]
-        valid = len(y)
-        if valid < self.context:
-            x_pad = torch.zeros(self.context, dtype=torch.long)
-            y_pad = torch.full((self.context,), -100, dtype=torch.long)
-            x_pad[:valid] = x
-            y_pad[:valid] = y
-            return x_pad, y_pad
-        return x, y
-
-
-@dataclass
+@dataclass(frozen=True)
 class ModelConfig:
     context: int = 256
     d_model: int = 256
@@ -49,14 +24,13 @@ class ModelConfig:
     dropout: float = 0.0
 
 
-@dataclass
+@dataclass(frozen=True)
 class TrainConfig:
     batch_size: int = 16
     epochs: int = 1
     lr: float = 3e-4
     weight_decay: float = 0.1
     max_train_steps: int = 0
-    grad_clip: float = 1.0
     seed: int = 1337
 
 
@@ -75,7 +49,71 @@ class StageResult:
     optimizer_steps: int
 
 
-def seed_everything(seed: int) -> None:
+class TokenWindows(Dataset):
+    def __init__(self, ids: list[int], context: int):
+        if len(ids) < 2:
+            raise ValueError("need at least two tokens")
+        self.ids = torch.tensor(ids, dtype=torch.long)
+        self.context = context
+        self.n = math.ceil((len(ids) - 1) / context)
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        start = idx * self.context
+        end = min(start + self.context + 1, len(self.ids))
+        chunk = self.ids[start:end]
+        x = chunk[:-1]
+        y = chunk[1:]
+        return x, y
+
+
+def collate_windows(batch):
+    max_len = max(x.shape[0] for x, _ in batch)
+    xs = torch.zeros((len(batch), max_len), dtype=torch.long)
+    ys = torch.full((len(batch), max_len), -100, dtype=torch.long)
+    for i, (x, y) in enumerate(batch):
+        xs[i, : len(x)] = x
+        ys[i, : len(y)] = y
+    return xs, ys
+
+
+class CausalTransformer(nn.Module):
+    def __init__(self, vocab_size: int, cfg: ModelConfig):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context = cfg.context
+        self.token = nn.Embedding(vocab_size, cfg.d_model)
+        self.pos = nn.Embedding(cfg.context, cfg.d_model)
+        layer = nn.TransformerEncoderLayer(
+            d_model=cfg.d_model,
+            nhead=cfg.n_heads,
+            dim_feedforward=cfg.d_model * cfg.mlp_ratio,
+            dropout=cfg.dropout,
+            batch_first=True,
+            norm_first=True,
+            activation="gelu",
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=cfg.n_layers)
+        self.norm = nn.LayerNorm(cfg.d_model)
+        self.head = nn.Linear(cfg.d_model, vocab_size, bias=False)
+        self.head.weight = self.token.weight
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        _, t = ids.shape
+        if t > self.context:
+            raise ValueError(f"sequence length {t} exceeds context {self.context}")
+        positions = torch.arange(t, device=ids.device)
+        h = self.token(ids) + self.pos(positions)[None, :, :]
+        mask = torch.triu(
+            torch.ones(t, t, device=ids.device, dtype=torch.bool), diagonal=1
+        )
+        h = self.transformer(h, mask=mask)
+        return self.head(self.norm(h))
+
+
+def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -84,109 +122,76 @@ def seed_everything(seed: int) -> None:
 
 
 def autocast_context(device: torch.device):
-    if device.type != "cuda":
-        return torch.autocast(device_type="cpu", enabled=False)
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    return torch.autocast(device_type="cuda", dtype=dtype)
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return torch.autocast(device_type="cpu", enabled=False)
 
 
-def make_model(
-    vocab_size: int, cfg: ModelConfig, device: torch.device, seed: int
-) -> TinyGPT:
-    seed_everything(seed)
-    model = TinyGPT(
-        vocab_size=vocab_size,
-        context=cfg.context,
-        d_model=cfg.d_model,
-        n_layers=cfg.n_layers,
-        n_heads=cfg.n_heads,
-        mlp_ratio=cfg.mlp_ratio,
-        dropout=cfg.dropout,
-    )
-    return model.to(device)
-
-
-def train_prefix(
-    model: TinyGPT,
+def train_model(
     ids: list[int],
-    cfg: ModelConfig,
+    vocab_size: int,
+    model_cfg: ModelConfig,
     train_cfg: TrainConfig,
     device: torch.device,
-) -> tuple[int, float]:
-    ds = TokenWindows(ids, cfg.context)
-    if len(ds) == 0:
-        return 0, 0.0
-    g = torch.Generator()
-    g.manual_seed(train_cfg.seed)
+) -> tuple[CausalTransformer, int, float]:
+    set_seed(train_cfg.seed)
+    model = CausalTransformer(vocab_size, model_cfg).to(device)
+    ds = TokenWindows(ids, model_cfg.context)
     loader = DataLoader(
         ds,
         batch_size=train_cfg.batch_size,
         shuffle=True,
-        generator=g,
-        drop_last=False,
+        collate_fn=collate_windows,
         pin_memory=device.type == "cuda",
     )
-    opt = torch.optim.AdamW(
-        model.parameters(),
-        lr=train_cfg.lr,
-        weight_decay=train_cfg.weight_decay,
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay
     )
 
     model.train()
     steps = 0
     start_time = time.perf_counter()
-    stop = False
-    for epoch in range(train_cfg.epochs):
-        bar = tqdm(
-            loader, desc=f"train epoch {epoch + 1}/{train_cfg.epochs}", leave=False
-        )
-        for x, y in bar:
+    for _ in range(train_cfg.epochs):
+        for x, y in tqdm(loader, desc="train", leave=False):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
-            opt.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
             with autocast_context(device):
                 logits = model(x)
                 loss = F.cross_entropy(
-                    logits.reshape(-1, model.vocab_size), y.reshape(-1)
+                    logits.reshape(-1, vocab_size), y.reshape(-1), ignore_index=-100
                 )
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg.grad_clip)
-            opt.step()
+            optimizer.step()
             steps += 1
-            bar.set_postfix(loss=f"{loss.item():.3f}")
             if train_cfg.max_train_steps and steps >= train_cfg.max_train_steps:
-                stop = True
-                break
-        if stop:
-            break
-    return steps, time.perf_counter() - start_time
+                return model, steps, time.perf_counter() - start_time
+    return model, steps, time.perf_counter() - start_time
 
 
-@torch.inference_mode()
-def score_block_bits(
-    model: TinyGPT,
+@torch.no_grad()
+def score_model(
+    model: CausalTransformer,
     ids: list[int],
-    cfg: ModelConfig,
-    batch_size: int,
+    context: int,
     device: torch.device,
+    batch_size: int,
 ) -> tuple[float, float]:
-    if not ids:
+    if len(ids) < 2:
         return 0.0, 0.0
-    # The block is treated as a fresh message. Its first token has no previous
-    # token context, so send it under the uniform prior. Remaining tokens are
-    # scored causally by the Transformer.
-    total_bits = math.log2(model.vocab_size)
-    ds = TokenWindows(ids, cfg.context)
-    if len(ds) == 0:
-        return total_bits, 0.0
+    model.eval()
+    ds = TokenWindows(ids, context)
     loader = DataLoader(
         ds,
         batch_size=batch_size,
         shuffle=False,
-        drop_last=False,
+        collate_fn=collate_windows,
         pin_memory=device.type == "cuda",
     )
-    model.eval()
+    # Every window predicts token 1..N from token 0..N-1. The first token of
+    # each independently encoded evaluation block needs a uniform code because
+    # this toy setup does not pass train-prefix context into scoring.
+    total_bits = math.log2(model.vocab_size)
     nats = 0.0
     start_time = time.perf_counter()
     for x, y in tqdm(loader, desc="score", leave=False):
@@ -198,6 +203,7 @@ def score_block_bits(
                 logits.reshape(-1, model.vocab_size),
                 y.reshape(-1),
                 reduction="sum",
+                ignore_index=-100,
             )
         nats += float(loss_sum)
     total_bits += nats / math.log(2.0)
@@ -238,7 +244,7 @@ def run_block_prequential(
 ) -> dict:
     if not fractions or fractions[-1] != 1.0:
         raise ValueError("fractions must end in 1.0")
-    if any(a >= b for a, b in itertools.pairwise(fractions, fractions[1:])):
+    if any(a >= b for a, b in itertools.pairwise(fractions)):
         raise ValueError("fractions must be strictly increasing")
 
     boundaries = safe_utf8_boundaries(raw, fractions)
@@ -274,44 +280,50 @@ def run_block_prequential(
         train_ids = tokenizer.encode(train_text)
         eval_ids = tokenizer.encode(eval_text)
 
-        model = make_model(vocab, model_cfg, device, train_cfg.seed)
         print(
-            f"[{name}] stage {i + 1}: train={train_end / 1e6:.2f} MB "
-            f"({len(train_ids):,} tok), eval={(eval_end - train_end) / 1e6:.2f} MB "
-            f"({len(eval_ids):,} tok)"
+            f"[{name}] stage {i + 1}/{len(boundaries) - 1}: "
+            f"train={train_end / 1e6:.2f}MB ({len(train_ids):,} tok), "
+            f"score={(eval_end - train_end) / 1e6:.2f}MB ({len(eval_ids):,} tok)"
         )
-        steps, train_seconds = train_prefix(
-            model, train_ids, model_cfg, train_cfg, device
+        model, steps, train_seconds = train_model(
+            train_ids,
+            vocab,
+            model_cfg,
+            train_cfg,
+            device,
         )
-        bits, eval_seconds = score_block_bits(
-            model, eval_ids, model_cfg, train_cfg.batch_size, device
+        bits, eval_seconds = score_model(
+            model,
+            eval_ids,
+            model_cfg.context,
+            device,
+            train_cfg.batch_size,
         )
-        stage = StageResult(
-            train_fraction=actual_fractions[i],
-            eval_fraction_end=actual_fractions[i + 1],
-            train_bytes=train_end,
-            eval_bytes=eval_end - train_end,
-            train_tokens=len(train_ids),
-            eval_tokens=len(eval_ids),
-            bits=bits,
-            bits_per_byte=bits / (eval_end - train_end),
-            train_seconds=train_seconds,
-            eval_seconds=eval_seconds,
-            optimizer_steps=steps,
+        stages.append(
+            StageResult(
+                train_fraction=actual_fractions[i],
+                eval_fraction_end=actual_fractions[i + 1],
+                train_bytes=train_end,
+                eval_bytes=eval_end - train_end,
+                train_tokens=len(train_ids),
+                eval_tokens=len(eval_ids),
+                bits=bits,
+                bits_per_byte=bits / (eval_end - train_end),
+                train_seconds=train_seconds,
+                eval_seconds=eval_seconds,
+                optimizer_steps=steps,
+            )
         )
-        stages.append(stage)
-        print(f"[{name}] stage {i + 1}: {stage.bits_per_byte:.4f} bits/byte")
-        del model
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        print(
+            f"[{name}]   {bits / (eval_end - train_end):.4f} bits/byte; "
+            f"train {train_seconds:.1f}s; score {eval_seconds:.1f}s"
+        )
 
     total_bits = sum(s.bits for s in stages)
-    total_bytes = sum(s.eval_bytes for s in stages)
-    return {
+    result = {
         "name": name,
-        "vocab_size": vocab,
-        "total_bits": total_bits,
-        "total_bytes": total_bytes,
-        "prequential_bits_per_byte": total_bits / total_bytes,
-        "stages": [asdict(s) for s in stages],
+        "prequential_bits": total_bits,
+        "prequential_bits_per_byte": total_bits / len(raw),
+        "stages": [s.__dict__ for s in stages],
     }
+    return result
