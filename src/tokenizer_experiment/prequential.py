@@ -26,11 +26,11 @@ class TrainConfig:
 
 @dataclass
 class OnlinePoint:
-    datum: int
-    datum_bytes: int
-    datum_tokens: int
-    datum_bits: float
-    datum_bits_per_byte: float
+    update: int
+    update_bytes: int
+    update_tokens: int
+    update_bits: float
+    update_bits_per_byte: float
     cumulative_bytes: int
     cumulative_tokens: int
     cumulative_bits: float
@@ -53,82 +53,103 @@ def autocast_context(device: torch.device):
     return torch.autocast(device_type="cpu", enabled=False)
 
 
-def _online_datum_step(
+def _stream_update_step(
     model: CausalTransformer,
     optimizer: torch.optim.Optimizer,
     ids: list[int],
     *,
+    start_token: int,
+    end_token: int,
     bos_id: int,
     context: int,
     device: torch.device,
 ) -> float:
-    """Measure one datum's NLL, then update once from that exact loss.
+    """Score one new continuous-stream segment, then update once from that loss.
 
-    Datum boundaries are side information supplied by the dataset protocol, so
-    they are not coded as synthetic EOS targets. The tokenizer's reserved EOS
-    embedding is reused only as a fixed start-of-datum/BOS context:
+    ``ids`` is the tokenization of the *entire* continuous prequential stream.
+    Tokens before ``start_token`` remain available as autoregressive context.
+    Only targets in ``[start_token, end_token)`` contribute to the code/loss.
 
-        <BOS> token_0 ... token_n
-
-    Long datums are evaluated in context-sized chunks. Gradients from all chunks
-    are accumulated before the single optimizer step, so every probability used
-    in the prequential code comes from the model state *before* this datum is
-    learned.
+    The model cannot process more than ``context`` input positions at once. For
+    a large update segment we therefore score it in subchunks of at most half a
+    context window. This reserves at least half of each window for preceding
+    stream context once enough history exists. Gradients from all subchunks are
+    accumulated before the single optimizer step, so every probability charged
+    to this update comes from the pre-update model state.
     """
-    if not ids:
-        raise ValueError("online datum must contain at least one token")
+    if not (0 <= start_token < end_token <= len(ids)):
+        raise ValueError("invalid token update range")
+    if context < 2:
+        raise ValueError("context must be at least 2")
 
     sequence = [bos_id, *ids]
-    predictions = len(ids)
+    update_tokens = end_token - start_token
+    max_new_tokens = max(1, context // 2)
 
     optimizer.zero_grad(set_to_none=True)
     model.train()
     total_nats = 0.0
 
-    # Each content token is scored exactly once. Context resets only for unusually
-    # long datums that exceed the model's token context; the optimizer still steps
-    # exactly once for the whole datum.
-    for start in range(0, predictions, context):
-        end = min(start + context, predictions)
-        x = torch.tensor(sequence[start:end], dtype=torch.long, device=device)[None, :]
-        y = torch.tensor(sequence[start + 1 : end + 1], dtype=torch.long, device=device)[
-            None, :
-        ]
+    for chunk_start in range(start_token, end_token, max_new_tokens):
+        chunk_end = min(chunk_start + max_new_tokens, end_token)
+        new_tokens = chunk_end - chunk_start
+
+        # sequence position q predicts q+1. Ending x at `chunk_end` makes its
+        # final logit predict ids[chunk_end-1]. Keep as much preceding stream
+        # context as fits while reserving room for all new targets in this chunk.
+        x_end = chunk_end
+        x_start = max(0, x_end - context)
+        x = torch.tensor(
+            sequence[x_start:x_end], dtype=torch.long, device=device
+        )[None, :]
+        targets = torch.tensor(
+            ids[chunk_start:chunk_end], dtype=torch.long, device=device
+        )[None, :]
+
         with autocast_context(device):
             logits = model(x)
+            new_logits = logits[:, -new_tokens:, :]
             loss_sum = F.cross_entropy(
-                logits.reshape(-1, model.vocab_size),
-                y.reshape(-1),
+                new_logits.reshape(-1, model.vocab_size),
+                targets.reshape(-1),
                 reduction="sum",
             )
+
         total_nats += float(loss_sum.detach())
-        # Normalize the update by datum size so a long line does not implicitly
-        # get a larger learning rate than a short line.
-        (loss_sum / predictions).backward()
+        (loss_sum / update_tokens).backward()
 
     optimizer.step()
     return total_nats / math.log(2.0)
 
 
-def run_online_prequential(
+def run_stream_prequential(
     *,
     name: str,
     tokenizer,
-    datums: list[bytes],
+    ids: list[int],
+    raw_boundaries: list[int],
+    token_boundaries: list[int],
     model_cfg: ModelConfig,
     train_cfg: TrainConfig,
     device: torch.device,
     log_every: int = 100,
     on_progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """Online prequential code: loss(datum), then one update, exactly once.
+    """Online prequential code over one continuous token stream.
 
-    This is intentionally *not* block prequential coding. A single model is
-    initialized once and walks through the data in order. Datum boundaries are
-    fixed by the raw dataset before tokenization and are shared by all tokenizers.
+    Raw update boundaries are shared across tokenizers. They affect only when
+    the optimizer is allowed to learn; they do not reset the Transformer
+    context or retokenize the stream. Each update is scored before its single
+    optimizer step.
     """
-    if not datums:
-        raise ValueError("need at least one online datum")
+    if not ids:
+        raise ValueError("need a nonempty token stream")
+    if not raw_boundaries or not token_boundaries:
+        raise ValueError("need update boundaries")
+    if len(raw_boundaries) != len(token_boundaries):
+        raise ValueError("raw/token boundary counts differ")
+    if raw_boundaries[-1] <= 0 or token_boundaries[-1] != len(ids):
+        raise ValueError("final boundaries must cover the whole stream")
     if log_every <= 0:
         raise ValueError("log_every must be positive")
 
@@ -139,43 +160,51 @@ def run_online_prequential(
     )
 
     total_bits = 0.0
-    total_bytes = 0
     total_tokens = 0
     trace: list[dict[str, Any]] = []
     start_time = time.perf_counter()
+    prev_raw = 0
+    prev_token = 0
 
-    progress = tqdm(enumerate(datums, start=1), total=len(datums), desc=name)
-    for datum_i, raw in progress:
-        text = raw.decode("utf-8")
-        ids = tokenizer.encode(text)
-        bits = _online_datum_step(
+    progress = tqdm(
+        enumerate(zip(raw_boundaries, token_boundaries), start=1),
+        total=len(raw_boundaries),
+        desc=name,
+    )
+    for update_i, (raw_end, token_end) in progress:
+        if raw_end <= prev_raw or token_end <= prev_token:
+            raise ValueError("update boundaries must be strictly increasing")
+
+        bits = _stream_update_step(
             model,
             optimizer,
             ids,
+            start_token=prev_token,
+            end_token=token_end,
             bos_id=tokenizer.eos_id,
             context=model_cfg.context,
             device=device,
         )
 
-        datum_bytes = len(raw)
+        update_bytes = raw_end - prev_raw
+        update_tokens = token_end - prev_token
         total_bits += bits
-        total_bytes += datum_bytes
-        total_tokens += len(ids)
+        total_tokens += update_tokens
         point = OnlinePoint(
-            datum=datum_i,
-            datum_bytes=datum_bytes,
-            datum_tokens=len(ids),
-            datum_bits=bits,
-            datum_bits_per_byte=bits / datum_bytes,
-            cumulative_bytes=total_bytes,
+            update=update_i,
+            update_bytes=update_bytes,
+            update_tokens=update_tokens,
+            update_bits=bits,
+            update_bits_per_byte=bits / update_bytes,
+            cumulative_bytes=raw_end,
             cumulative_tokens=total_tokens,
             cumulative_bits=total_bits,
-            cumulative_bits_per_byte=total_bits / total_bytes,
-            optimizer_steps=datum_i,
+            cumulative_bits_per_byte=total_bits / raw_end,
+            optimizer_steps=update_i,
             elapsed_seconds=time.perf_counter() - start_time,
         )
 
-        if datum_i == 1 or datum_i % log_every == 0 or datum_i == len(datums):
+        if update_i == 1 or update_i % log_every == 0 or update_i == len(raw_boundaries):
             payload = asdict(point)
             trace.append(payload)
             if on_progress is not None:
@@ -185,15 +214,18 @@ def run_online_prequential(
                 mb=f"{point.cumulative_bytes / 1e6:.2f}",
             )
 
+        prev_raw = raw_end
+        prev_token = token_end
+
     elapsed = time.perf_counter() - start_time
     return {
         "name": name,
-        "protocol": "online-prequential",
+        "protocol": "continuous-stream-online-prequential",
         "prequential_bits": total_bits,
-        "prequential_bits_per_byte": total_bits / total_bytes,
-        "encoded_bytes": total_bytes,
-        "datums": len(datums),
-        "optimizer_steps": len(datums),
+        "prequential_bits_per_byte": total_bits / raw_boundaries[-1],
+        "encoded_bytes": raw_boundaries[-1],
+        "updates": len(raw_boundaries),
+        "optimizer_steps": len(raw_boundaries),
         "tokens": total_tokens,
         "elapsed_seconds": elapsed,
         "code_curve": trace,
