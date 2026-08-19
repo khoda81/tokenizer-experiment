@@ -46,6 +46,22 @@ def test_scoring_uniform_model_is_exact_uniform_code():
     assert bits == pytest.approx(len(ids) * math.log2(vocab_size), rel=1e-6)
 
 
+def test_single_token_block_uses_uniform_code():
+    vocab_size = 17
+    model = UniformModel(vocab_size)
+
+    bits, seconds = score_model(
+        model,
+        [3],
+        context=7,
+        device=torch.device("cpu"),
+        batch_size=3,
+    )
+
+    assert bits == pytest.approx(math.log2(vocab_size))
+    assert seconds == 0.0
+
+
 def test_transformer_uses_small_tied_embedding_initialization():
     model = CausalTransformer(vocab_size=257, cfg=ModelConfig(d_model=64, n_heads=4))
 
