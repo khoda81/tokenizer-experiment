@@ -74,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=100,
         help="Log/checkpoint telemetry every N optimizer updates; does not affect coding.",
     )
+    p.add_argument(
+        "--artifact-every",
+        type=int,
+        default=1000,
+        help="Log a versioned W&B progress artifact every N optimizer updates.",
+    )
     p.add_argument("--device", default=None)
     p.add_argument("--output", default=str(ARTIFACTS_DIR / "results.json"))
     p.add_argument(
@@ -94,6 +100,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.artifact_every <= 0:
+        raise SystemExit("--artifact-every must be positive")
+
     kwargs = {
         "dataset_config": args.dataset_config,
         "vocab_size": args.vocab_size,
@@ -150,10 +159,26 @@ def main() -> None:
         mode=args.wandb_mode,
         # W&B itself creates a `wandb/` child under this directory.
         dir=str(ARTIFACTS_DIR),
-        config=asdict(config),
+        config={**asdict(config), "artifact_every": args.artifact_every},
         save_code=True,
         tags=["continuous-prequential", "tokenization", config.tunstall_mode, "bunstall"],
     ) as run:
+
+        def log_progress_artifact(model_name: str, update: int, status: str) -> None:
+            artifact = wandb.Artifact(
+                name="prequential-progress",
+                type="experiment-progress",
+                description="Incremental checkpoint from a continuous prequential run.",
+                metadata={
+                    "status": status,
+                    "model": model_name,
+                    "update": update,
+                    "seed": config.seed,
+                    "update_target_bytes": config.update_bytes,
+                },
+            )
+            artifact.add_file(str(partial_path), name="results.partial.json")
+            run.log_artifact(artifact)
 
         def on_progress(model_name: str, point: dict) -> None:
             key = model_name.replace("-", "_")
@@ -195,6 +220,9 @@ def main() -> None:
                 }
             )
 
+            if point["update"] == 1 or point["update"] % args.artifact_every == 0:
+                log_progress_artifact(model_name, point["update"], "running")
+
         try:
             payload = run_experiment(config, on_progress=on_progress)
         except BaseException as exc:
@@ -202,6 +230,13 @@ def main() -> None:
             partial_state["error_type"] = type(exc).__name__
             partial_state["error"] = str(exc)
             atomic_write_json(partial_path, partial_state)
+            current_model = str(partial_state.get("current_model", "startup"))
+            models = partial_state["models"]
+            latest_update = 0
+            if isinstance(models, dict) and current_model in models:
+                latest = models[current_model].get("latest", {})
+                latest_update = int(latest.get("update", 0))
+            log_progress_artifact(current_model, latest_update, "interrupted")
             raise
 
         atomic_write_json(output_path, payload)
