@@ -28,7 +28,9 @@ def print_token_rows(name: str, rows: list[dict], top_n: int) -> None:
 
 def print_tunstall_splits(rows: list[dict]) -> None:
     print("\nTunstall expanded prefixes (all internal nodes except root)")
-    print("  mass/token  visits  seen/256   H(next)   2^H   H/255   prefix -> top continuations")
+    print(
+        "  mass/token  visits  seen/256   H(next)   2^H   H/255   prefix -> top continuations"
+    )
     for row in rows:
         continuation = ", ".join(
             f"{item['piece']}:{item['conditional_probability']:.1%}"

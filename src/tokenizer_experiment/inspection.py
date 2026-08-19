@@ -116,7 +116,9 @@ def tunstall_split_rows(
 
         children = tokenizer.nodes[node_id].children
         if children is None:
-            raise AssertionError("expected internal node while inspecting Tunstall tree")
+            raise AssertionError(
+                "expected internal node while inspecting Tunstall tree"
+            )
         node_id = children[symbol]
         if tokenizer.nodes[node_id].is_leaf:
             emitted_tokens += 1
@@ -150,7 +152,9 @@ def tunstall_split_rows(
                 "prefix_hex": bytes(node.phrase).hex(),
                 "prefix_bytes": len(node.phrase),
                 "visits": visits,
-                "mass_per_emitted_token": visits / emitted_tokens if emitted_tokens else 0.0,
+                "mass_per_emitted_token": visits / emitted_tokens
+                if emitted_tokens
+                else 0.0,
                 "observed_children": observed,
                 "unused_children": 256 - observed,
                 "next_byte_entropy_bits": entropy,
@@ -219,14 +223,18 @@ def bpe_merge_split_rows(
 def summarize_bpe_splits(rows: list[dict[str, Any]]) -> dict[str, float]:
     if not rows:
         return {}
-    entropies = np.asarray([row["binary_entropy_bits"] for row in rows], dtype=np.float64)
+    entropies = np.asarray(
+        [row["binary_entropy_bits"] for row in rows], dtype=np.float64
+    )
     qs = np.asarray([row["q_followed_by_right"] for row in rows], dtype=np.float64)
     support = np.asarray([row["left_occurrences"] for row in rows], dtype=np.float64)
     return {
         "count": float(len(rows)),
         "mean_binary_entropy_bits": float(entropies.mean()),
         "median_binary_entropy_bits": float(np.median(entropies)),
-        "support_weighted_binary_entropy_bits": float(np.average(entropies, weights=support)),
+        "support_weighted_binary_entropy_bits": float(
+            np.average(entropies, weights=support)
+        ),
         "median_q": float(np.median(qs)),
         "fraction_q_between_0.25_and_0.75": float(np.mean((qs >= 0.25) & (qs <= 0.75))),
     }
