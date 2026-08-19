@@ -278,7 +278,7 @@ class EmpiricalTunstallTokenizer:
 
     def assert_prefix_free(self) -> None:
         phrases = sorted(self._id_to_phrase)
-        for a, b in itertools.pairwise(phrases, phrases[1:]):
+        for a, b in itertools.pairwise(phrases):
             if len(a) <= len(b) and b[: len(a)] == a:
                 raise AssertionError(f"not prefix-free: {a} prefixes {b}")
 
@@ -314,9 +314,11 @@ class BPETokenizer:
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         )
 
-        # Chunk only to keep tokenizer training memory tame. use_regex=False
-        # avoids GPT-2 word splitting; the only lost merges are across chunk edges.
-        char_chunk = 1_000_000
+        # `use_regex=False` deliberately lets BPE merge arbitrary byte pairs,
+        # but giving the trainer a multi-megabyte sequence makes each merge
+        # pathologically expensive. Split into modest sequences instead. The
+        # only approximation is that merges cannot cross these chunk edges.
+        char_chunk = 8_192
         iterator = (text[i : i + char_chunk] for i in range(0, len(text), char_chunk))
         tokenizer.train_from_iterator(
             iterator, trainer=trainer, length=math.ceil(len(text) / char_chunk)
