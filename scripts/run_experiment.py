@@ -167,6 +167,19 @@ def main() -> None:
         payload = run_experiment(config, on_stage=on_stage)
         output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+        results_artifact = wandb.Artifact(
+            name="prequential-results",
+            type="experiment-results",
+            description="Block-prequential tokenizer comparison results.",
+            metadata={
+                "dataset_config": config.dataset_config,
+                "vocab_size": payload["metadata"]["actual_vocab_size"],
+                "seed": config.seed,
+            },
+        )
+        results_artifact.add_file(str(output_path), name="results.json")
+        run.log_artifact(results_artifact)
+
         table = wandb.Table(columns=columns, data=curve_rows)
         run.log(
             {
@@ -203,7 +216,7 @@ def main() -> None:
         bpb = result["prequential_bits_per_byte"]
         suffix = "" if result["name"] == "bpe" else f"  ({bpb - bpe_bpb:+.6f} vs BPE)"
         print(f"  {result['name']:20s} {bpb:.6f} bits/byte{suffix}")
-    print(f"\nWrote {output_path} (including per-model code_curve traces)")
+    print(f"\nWrote {output_path} and logged W&B artifact prequential-results")
 
 
 if __name__ == "__main__":
