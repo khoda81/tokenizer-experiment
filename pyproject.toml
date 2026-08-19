@@ -1,7 +1,7 @@
 [project]
 name = "tokenizer-experiment"
 version = "0.1.0"
-description = "WikiText experiments comparing tokenizers under block-prequential Transformer codelength."
+description = "WikiText experiments comparing tokenizers under online prequential Transformer codelength."
 requires-python = ">=3.11"
 dependencies = [
   "datasets>=3.0",
