@@ -1,0 +1,21 @@
+[project]
+name = "tunstall-bpe-prequential"
+version = "0.1.0"
+description = "Small WikiText experiment comparing byte-level BPE and prefix-free Tunstall-style tokenization under block-prequential Transformer codelength."
+requires-python = ">=3.11"
+dependencies = [
+  "datasets>=3.0",
+  "numpy>=1.26",
+  "tokenizers>=0.20",
+  "torch>=2.4",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.uv]
+package = false
