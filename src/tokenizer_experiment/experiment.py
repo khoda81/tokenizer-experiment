@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import math
 import platform
 import sys
@@ -11,8 +12,9 @@ import numpy as np
 import torch
 from datasets import load_dataset
 
+from .inspection import bytelevel_piece_bytes
 from .model import ModelConfig
-from .prequential import ProgressCallback, TrainConfig, run_online_prequential
+from .prequential import ProgressCallback, TrainConfig, run_stream_prequential
 from .sparse_prefix import SparsePrefixTokenizer
 from .tunstall import BPETokenizer, EmpiricalTunstallTokenizer
 
@@ -25,6 +27,7 @@ class ExperimentConfig:
     bunstall_modes: tuple[str, ...] = ("frequency", "entropy")
     tokenizer_fit_mb: float = 2.0
     max_preq_mb: float = 0.0
+    update_bytes: int = 256
     context: int = 256
     d_model: int = 256
     layers: int = 4
@@ -77,62 +80,80 @@ def _cap_rows(rows: list[bytes], max_bytes: int) -> list[bytes]:
         out.append(raw)
         total += len(raw)
     if not out:
-        raise ValueError("max_preq_mb is smaller than the first prequential datum")
+        raise ValueError("max_preq_mb is smaller than the first remaining row")
     return out
 
 
-def _group_tunstall_safe_rows(
-    rows: list[bytes], tokenizer: EmpiricalTunstallTokenizer
-) -> tuple[list[bytes], list[int], int]:
-    """Maximize row-level datum count subject to complete Tunstall phrases.
-
-    We close a datum at every dataset-row boundary where the continuously parsed
-    Tunstall tree has returned to its root. Adjacent rows are merged only when a
-    phrase straddles their boundary. The resulting raw datums are then shared by
-    every tokenizer.
-    """
-    datums: list[bytes] = []
-    rows_per_datum: list[int] = []
-    buf = bytearray()
-    buffered_rows = 0
-    node_id = tokenizer.root
-
-    for raw in rows:
-        buf.extend(raw)
-        buffered_rows += 1
-        for sym in raw:
-            children = tokenizer.nodes[node_id].children
-            if children is None:
-                raise AssertionError("expected Tunstall internal node")
-            node_id = children[sym]
-            if tokenizer.nodes[node_id].is_leaf:
-                node_id = tokenizer.root
-
-        if node_id == tokenizer.root:
-            datums.append(bytes(buf))
-            rows_per_datum.append(buffered_rows)
-            buf.clear()
-            buffered_rows = 0
-
-    return datums, rows_per_datum, len(buf)
+def _token_piece_bytes(tokenizer, token_id: int) -> bytes:
+    if isinstance(tokenizer, BPETokenizer):
+        token_text = tokenizer.tokenizer.id_to_token(token_id)
+        if token_text is None or token_id == tokenizer.eos_id:
+            raise ValueError(f"unexpected BPE token id in raw stream: {token_id}")
+        return bytelevel_piece_bytes(token_text)
+    return bytes(tokenizer.token_piece(token_id))
 
 
-def tokenizer_stats(tokenizer, datums: list[bytes]) -> dict[str, Any]:
-    counts = np.zeros(tokenizer.vocab_size, dtype=np.int64)
-    raw_bytes = 0
-    tokens = 0
-    for raw in datums:
-        ids = tokenizer.encode(raw.decode("utf-8"))
-        if ids:
-            counts += np.bincount(np.asarray(ids, dtype=np.int64), minlength=tokenizer.vocab_size)
-        raw_bytes += len(raw)
-        tokens += len(ids)
+def _encode_stream(tokenizer, raw: bytes) -> tuple[list[int], list[int]]:
+    """Tokenize once and return token-end offsets in raw UTF-8 bytes."""
+    ids = tokenizer.encode(raw.decode("utf-8"))
+    offsets = [0]
+    for token_id in ids:
+        piece = _token_piece_bytes(tokenizer, token_id)
+        if not piece:
+            raise ValueError("zero-byte token appeared in raw tokenization")
+        offsets.append(offsets[-1] + len(piece))
+    if offsets[-1] != len(raw):
+        raise AssertionError(
+            f"token pieces cover {offsets[-1]} bytes, expected {len(raw)}"
+        )
+    return ids, offsets
 
+
+def _shared_update_boundaries(
+    offsets_by_name: dict[str, list[int]], target_bytes: int
+) -> list[int]:
+    """Choose shared token boundaries near absolute raw-byte milestones."""
+    if target_bytes <= 0:
+        raise ValueError("update_bytes must be positive")
+    if not offsets_by_name:
+        raise ValueError("need token offsets")
+
+    finals = {offsets[-1] for offsets in offsets_by_name.values()}
+    if len(finals) != 1:
+        raise ValueError(f"tokenizers cover different raw lengths: {sorted(finals)}")
+    final = finals.pop()
+
+    common = set(offsets_by_name[next(iter(offsets_by_name))])
+    for offsets in offsets_by_name.values():
+        common.intersection_update(offsets)
+    common_sorted = sorted(common)
+    if not common_sorted or common_sorted[0] != 0 or common_sorted[-1] != final:
+        raise RuntimeError("stream start/end are not common token boundaries")
+
+    boundaries: list[int] = []
+    last = 0
+    for target in range(target_bytes, final, target_bytes):
+        i = bisect.bisect_left(common_sorted, target)
+        if i == len(common_sorted):
+            break
+        boundary = common_sorted[i]
+        if boundary > last and boundary < final:
+            boundaries.append(boundary)
+            last = boundary
+    if not boundaries or boundaries[-1] != final:
+        boundaries.append(final)
+    return boundaries
+
+
+def tokenizer_stats(tokenizer, ids: list[int], raw_bytes: int) -> dict[str, Any]:
+    counts = np.bincount(
+        np.asarray(ids, dtype=np.int64), minlength=tokenizer.vocab_size
+    )
     probs = counts[counts > 0] / counts.sum()
     entropy = float(-(probs * np.log2(probs)).sum())
-    bytes_per_token = raw_bytes / tokens
+    bytes_per_token = raw_bytes / len(ids)
     return {
-        "tokens": tokens,
+        "tokens": len(ids),
         "bytes": raw_bytes,
         "bytes_per_token": bytes_per_token,
         "unigram_entropy_bits_per_token": entropy,
@@ -154,7 +175,7 @@ def run_experiment(
     actual_vocab = EmpiricalTunstallTokenizer.legal_vocab_size(config.vocab_size)
     print(
         f"Requested vocab {config.vocab_size}; using exact shared model vocab {actual_vocab} "
-        f"(4081 phrase slots + one separate EOS at this size)"
+        f"(4081 phrase slots + one reserved BOS token at this size)"
     )
     print(f"Loading Salesforce/wikitext / {config.dataset_config} ...")
     ds = load_dataset("Salesforce/wikitext", config.dataset_config, split="train")
@@ -168,10 +189,10 @@ def run_experiment(
     if config.max_preq_mb > 0:
         preq_rows = _cap_rows(preq_rows, int(config.max_preq_mb * 1_000_000))
     fit_text = fit_raw.decode("utf-8")
-    candidate_bytes = sum(map(len, preq_rows))
+    preq_raw = b"".join(preq_rows)
     print(
         f"tokenizer fit: {mb(len(fit_raw)):.2f} MB; "
-        f"candidate online stream: {mb(candidate_bytes):.2f} MB in {len(preq_rows):,} rows"
+        f"candidate continuous stream: {mb(len(preq_raw)):.2f} MB"
     )
 
     print(f"\nTraining {config.tunstall_mode} Tunstall-style tokenizer ...")
@@ -186,17 +207,16 @@ def run_experiment(
         f"max phrase={tunstall.max_phrase_bytes()} bytes"
     )
 
-    datums, rows_per_datum, dropped_tail = _group_tunstall_safe_rows(preq_rows, tunstall)
-    online_bytes = sum(map(len, datums))
+    # Only the end of the complete continuous stream needs to be a Tunstall
+    # phrase boundary. Optimizer/update boundaries are chosen later from token
+    # boundaries shared by every tokenizer.
+    encoded_end = tunstall.align_utf8_boundaries(preq_raw, [1.0])[0]
+    dropped_tail = len(preq_raw) - encoded_end
+    preq_raw = preq_raw[:encoded_end]
     print(
-        f"online datums: {len(datums):,} from {sum(rows_per_datum):,} rows; "
-        f"{mb(online_bytes):.2f} MB; dropped trailing incomplete group={dropped_tail} bytes"
+        f"continuous online stream: {mb(len(preq_raw)):.2f} MB; "
+        f"dropped trailing partial Tunstall phrase={dropped_tail} bytes"
     )
-    if rows_per_datum:
-        print(
-            f"rows/datum: mean={np.mean(rows_per_datum):.3f}, "
-            f"max={max(rows_per_datum)}, single-row={np.mean(np.asarray(rows_per_datum) == 1):.1%}"
-        )
 
     print("\nTraining byte-level BPE tokenizer ...")
     t0 = time.perf_counter()
@@ -216,19 +236,22 @@ def run_experiment(
             f"max phrase={tokenizer.max_phrase_bytes()} bytes"
         )
 
-    # Experimental/new tokenizers intentionally run first. Baselines come last
-    # so a clearly bad new idea can be stopped early without re-running known
-    # controls before we have learned anything new.
+    # Experimental/new tokenizers intentionally run first. Baselines come last.
     tokenizers: list[tuple[str, Any]] = [
         *[(f"bunstall-{mode}", bunstalls[mode]) for mode in config.bunstall_modes],
         ("bpe", bpe),
         (f"tunstall-{config.tunstall_mode}", tunstall),
     ]
 
-    print("\nTokenizer diagnostics on the actual online datums:")
+    print("\nTokenizing the continuous stream once per tokenizer ...")
+    streams: dict[str, tuple[list[int], list[int]]] = {}
     stats_by_name: dict[str, dict[str, Any]] = {}
+    offsets_by_name: dict[str, list[int]] = {}
     for name, tokenizer in tokenizers:
-        stats = tokenizer_stats(tokenizer, datums)
+        ids, offsets = _encode_stream(tokenizer, preq_raw)
+        streams[name] = (ids, offsets)
+        offsets_by_name[name] = offsets
+        stats = tokenizer_stats(tokenizer, ids, len(preq_raw))
         stats_by_name[name] = stats
         print(
             f"  {name:20s}: {stats['bytes_per_token']:.3f} bytes/token, "
@@ -236,6 +259,19 @@ def run_experiment(
             f"unigram={stats['unigram_bits_per_byte']:.4f} bpb, "
             f"used={stats['distinct_tokens_used']}/{actual_vocab}"
         )
+
+    raw_boundaries = _shared_update_boundaries(offsets_by_name, config.update_bytes)
+    update_sizes = np.diff(np.asarray([0, *raw_boundaries], dtype=np.int64))
+    print(
+        f"shared optimizer updates: {len(raw_boundaries):,}; "
+        f"target={config.update_bytes} raw bytes; "
+        f"mean={update_sizes.mean():.1f}, min={update_sizes.min()}, max={update_sizes.max()} bytes"
+    )
+
+    token_boundaries_by_name: dict[str, list[int]] = {}
+    for name, (_ids, offsets) in streams.items():
+        index_by_offset = {offset: i for i, offset in enumerate(offsets)}
+        token_boundaries_by_name[name] = [index_by_offset[b] for b in raw_boundaries]
 
     model_cfg = ModelConfig(
         context=config.context,
@@ -253,12 +289,15 @@ def run_experiment(
 
     results = []
     for name, tokenizer in tokenizers:
-        print(f"\n{'=' * 72}\nONLINE PREQUENTIAL: {name}\n{'=' * 72}")
+        ids, _offsets = streams[name]
+        print(f"\n{'=' * 72}\nCONTINUOUS PREQUENTIAL: {name}\n{'=' * 72}")
         results.append(
-            run_online_prequential(
+            run_stream_prequential(
                 name=name,
                 tokenizer=tokenizer,
-                datums=datums,
+                ids=ids,
+                raw_boundaries=raw_boundaries,
+                token_boundaries=token_boundaries_by_name[name],
                 model_cfg=model_cfg,
                 train_cfg=train_cfg,
                 device=device,
@@ -268,36 +307,35 @@ def run_experiment(
         )
 
     metadata = {
-        "protocol": "online-prequential: score datum, then update once from that same loss",
+        "protocol": (
+            "continuous-stream online prequential: tokenize once; preserve autoregressive "
+            "context across row/update boundaries; score each raw segment before one update"
+        ),
         "dataset": "Salesforce/wikitext",
         "dataset_config": config.dataset_config,
         "requested_vocab_size": config.vocab_size,
         "actual_vocab_size": actual_vocab,
         "tunstall_phrase_vocab_size": tunstall.phrase_vocab_size,
-        "eos_is_separate_token": True,
+        "reserved_special_token": "used as BOS only at the start of the continuous stream",
         "tunstall_mode": config.tunstall_mode,
         "bunstall_modes": list(config.bunstall_modes),
         "evaluation_order": [name for name, _ in tokenizers],
         "tokenizer_fit_bytes": len(fit_raw),
-        "candidate_prequential_rows": len(preq_rows),
-        "online_datums": len(datums),
-        "prequential_bytes": online_bytes,
+        "prequential_bytes": len(preq_raw),
         "dropped_tail_bytes": dropped_tail,
-        "datum_policy": (
-            "finest dataset-row groups whose ends are complete Tunstall phrase boundaries; "
-            "same raw datums for every tokenizer"
+        "stream_policy": (
+            "exact newline-joined WikiText byte stream; dataset rows do not reset model context"
         ),
-        "rows_per_datum_mean": float(np.mean(rows_per_datum)) if rows_per_datum else 0.0,
-        "rows_per_datum_max": max(rows_per_datum) if rows_per_datum else 0,
-        "single_row_datum_fraction": float(np.mean(np.asarray(rows_per_datum) == 1))
-        if rows_per_datum
-        else 0.0,
+        "update_target_bytes": config.update_bytes,
+        "shared_update_count": len(raw_boundaries),
+        "update_bytes_mean": float(update_sizes.mean()),
+        "update_bytes_min": int(update_sizes.min()),
+        "update_bytes_max": int(update_sizes.max()),
         "model": asdict(model_cfg),
         "training": asdict(train_cfg),
-        "batch_size_datums": 1,
+        "optimizer_steps": len(raw_boundaries),
         "passes_over_stream": 1,
-        "optimizer_steps": len(datums),
-        "log_every_datums": config.log_every,
+        "log_every_updates": config.log_every,
         "device": str(device),
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
         "torch": torch.__version__,
