@@ -1,8 +1,10 @@
 # Tokenizer experiment
 
-Small controlled experiments comparing tokenizers by **block-prequential codelength in bits per raw UTF-8 byte**.
+Small controlled experiments comparing tokenizers by **online prequential codelength in bits per raw UTF-8 byte**.
 
 The experiments compare byte-level BPE, prefix-free Tunstall-style byte phrases, and sparse-prefix ("Bunstall") tokenizers using the same flat-softmax Transformer.
+
+> Experiments 001 and 003 used an earlier geometric **block-prequential** evaluator. Those model results are retained as legacy diagnostics but are not the intended online-prequential measurement.
 
 ## Layout
 
@@ -12,7 +14,7 @@ src/tokenizer_experiment/
   tunstall.py       BPE and Tunstall tokenizers
   sparse_prefix.py  sparse-prefix / Bunstall tokenizer
   inspection.py     tokenizer structure diagnostics
-  prequential.py    one-pass block-prequential evaluation
+  prequential.py    online datum-by-datum prequential evaluation
   experiment.py     reusable WikiText experiment orchestration
 
 scripts/
@@ -21,8 +23,9 @@ scripts/
   inspect_bunstall.py    inspect sparse-prefix tokenizer variants
 
 docs/experiments/
-  001-bpe-vs-tunstall-wikitext2.md
-  002-sparse-prefix-bunstall.md
+  001-bpe-vs-tunstall-wikitext2.md       legacy block-prequential
+  002-sparse-prefix-bunstall.md           tokenizer-only structural experiment
+  003-legacy-block-prequential-bunstall.md
 
 artifacts/               local generated outputs; gitignored
 
@@ -32,6 +35,30 @@ tests/
 
 Reusable logic belongs under `src/tokenizer_experiment`. Scripts should be thin entry points around that package.
 
+## Correct online-prequential protocol
+
+The model is initialized once and walks through the stream exactly once:
+
+```python
+for datum in stream:
+    loss = model.loss(datum)   # probability before learning this datum
+    prequential_bits += loss
+    loss.backward()
+    optimizer.step()           # exactly one update for this datum
+```
+
+There is no held-out scoring pass, no geometric blocking, no retraining from scratch, and no second epoch. Batch size is one **raw datum**.
+
+The default datums are as fine-grained as possible while remaining identical for every tokenizer: start from individual WikiText dataset rows and greedily merge adjacent rows only when necessary for a prefix-free Tunstall phrase to terminate at the datum boundary.
+
+Each datum is modeled as:
+
+```text
+<EOS-as-BOS> content tokens <EOS>
+```
+
+so the first content token is predicted by the model rather than charged an artificial uniform code. If an unusually long datum exceeds the 256-token model context, its loss is accumulated over context-sized chunks and the optimizer still steps only once after the complete datum has been scored.
+
 ## Run
 
 ```bash
@@ -39,7 +66,13 @@ uv sync --extra dev
 uv run python scripts/run_experiment.py
 ```
 
-W&B logging is enabled by default under project `tokenizer-experiment`. The run logs each prequential checkpoint live, stores comparison tables and curves, and logs the full result JSON as the versioned W&B Artifact `prequential-results`.
+Defaults include:
+
+- one persistent model per tokenizer,
+- batch size one datum,
+- exactly one pass over the ordered stream,
+- AdamW learning rate `1e-3`, deliberately aggressive for online learning,
+- W&B telemetry every 100 datums; logging frequency does not affect the code.
 
 Useful W&B options:
 
@@ -47,7 +80,7 @@ Useful W&B options:
 # Explicit project / run name
 uv run python scripts/run_experiment.py \
   --wandb-project tokenizer-experiment \
-  --wandb-run-name bunstall-uniformity-test
+  --wandb-run-name online-bunstall-uniformity
 
 # Keep W&B data local for later syncing
 uv run python scripts/run_experiment.py --wandb-mode offline
@@ -82,21 +115,17 @@ Inspection output includes:
 - learned BPE merges viewed as approximate binary continuation tests,
 - Bunstall promoted continuations and their binary split statistics.
 
-This tests the hypothesis that BPE and sparse-prefix tokenizers can spend one vocabulary slot at a time on useful refinements while a byte-level Tunstall expansion must spend 255 extra leaves at once.
-
 ## Default experiment
 
 - WikiText-2 raw.
-- First 2 MB fit the tokenizers and are treated as shared side information.
-- All remaining train bytes form the candidate prequential stream.
+- Roughly the first 2 MB of **complete dataset rows** fit the tokenizers and are treated as shared side information.
+- All remaining complete rows form the candidate online stream.
 - Requested vocabulary ~4096; the byte-only Tunstall tree plus separate EOS snaps this to 4082.
-- Checkpoints: `1%, 2%, 4%, 8%, 16%, 32%, 64%, 100%`.
 - Same 4-layer, 256-wide Transformer for every tokenizer.
 - Context 256 tokens.
-- Each observed prefix is trained from scratch for **exactly one pass**. There is no epoch parameter.
-- First block uses a uniform token code; later blocks use causal NLL from the model trained on the preceding raw-byte prefix.
-
-The current experiment preserves the original Tunstall-safe raw-byte checkpoint policy for comparability with Experiment 001.
+- One model initialization, one ordered pass, one optimizer update per raw datum.
+- Learning rate `1e-3` by default.
+- BPE, Tunstall-boundary, Bunstall-entropy, and Bunstall-frequency are compared on exactly the same raw datums.
 
 ## Outputs and W&B Artifacts
 
@@ -112,18 +141,17 @@ artifacts/
 
 The local JSON files are useful for immediate inspection, but **W&B Artifacts are the persistent experiment record**. Repeated logs of the same artifact collection create versioned outputs associated with their producing runs.
 
-`prequential-results` contains the machine-readable experiment result with metadata, stage records, final prequential code, and a compact `code_curve` containing:
+`prequential-results` contains the machine-readable online result with protocol metadata, final prequential code, tokenizer diagnostics, datum counts, and a compact `code_curve` sampled every logging interval with:
 
-- raw bytes encoded,
+- datum / optimizer step,
+- cumulative raw bytes and tokens,
 - cumulative bits and bits/byte,
-- training bytes and tokens,
-- per-model optimizer steps,
-- cumulative retraining work,
-- cumulative train + score wall time.
+- current datum bits/byte,
+- elapsed wall time.
 
 ## Experiments
 
-See `docs/experiments/` for recorded hypotheses, setups, and results.
+See `docs/experiments/` for recorded hypotheses, setups, results, and explicit legacy labels.
 
 ## CI
 
