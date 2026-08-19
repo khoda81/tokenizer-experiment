@@ -35,13 +35,13 @@ The goal is to maximize the number of natural raw datums while using identical b
 
 This greedily produces the maximum number of row-aligned datums allowed by the current Tunstall vocabulary. Every tokenizer sees exactly the same raw datums.
 
-Each datum is represented to the Transformer as:
+Each datum is scored as:
 
 ```text
-<EOS-as-BOS> content tokens <EOS>
+<EOS-as-BOS> content tokens
 ```
 
-so the first token is model-predicted and datum termination is explicit.
+The reserved EOS embedding is reused only as fixed start-of-datum context. The row/datum boundary itself is known side information, so it is **not** charged as an additional synthetic EOS target. The literal raw row separator is already present as its newline byte.
 
 ## Training
 
@@ -58,10 +58,14 @@ The maximum stable learning rate is an optimization hyperparameter rather than p
 
 ## Tokenizers
 
-- byte-level BPE,
-- Tunstall-boundary,
-- Bunstall-entropy,
-- Bunstall-frequency.
+Experimental variants run first so an obviously unpromising new tokenizer can be stopped before spending time revalidating established baselines.
+
+Current order:
+
+1. Bunstall-frequency,
+2. Bunstall-entropy,
+3. byte-level BPE,
+4. Tunstall-boundary.
 
 Tokenizer diagnostics include bytes/token, marginal token entropy, `H(T)/log2(V)`, unigram bits/raw-byte, and vocabulary utilization.
 
