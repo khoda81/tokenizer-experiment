@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import time
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import wandb
 from datasets import load_dataset
 
 from tokenizer_experiment.experiment import mb, split_tokenizer_fit, tokenizer_stats
@@ -106,6 +106,14 @@ def main() -> None:
     parser.add_argument(
         "--output", default=str(ARTIFACTS_DIR / "bunstall-inspection.json")
     )
+    parser.add_argument("--wandb-project", default="tokenizer-experiment")
+    parser.add_argument("--wandb-entity", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument(
+        "--wandb-mode",
+        choices=["online", "offline", "disabled"],
+        default="online",
+    )
     args = parser.parse_args()
 
     print(f"Loading Salesforce/wikitext / {args.dataset_config} ...")
@@ -188,7 +196,41 @@ def main() -> None:
     output_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    print(f"\nWrote {output_path}")
+
+    wandb_dir = ARTIFACTS_DIR / "wandb"
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+    with wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        mode=args.wandb_mode,
+        dir=str(wandb_dir),
+        job_type="tokenizer-inspection",
+        config={
+            "dataset_config": args.dataset_config,
+            "vocab_size": actual_vocab,
+            "tokenizer_fit_mb": args.tokenizer_fit_mb,
+            "bunstall_mode": args.mode,
+        },
+        tags=["tokenizer-inspection", "bunstall", args.mode],
+    ) as run:
+        run.log({f"tokenizer/{key}": value for key, value in stats.items() if isinstance(value, (int, float))})
+        artifact = wandb.Artifact(
+            name=f"bunstall-{args.mode}-inspection",
+            type="tokenizer-inspection",
+            metadata={
+                "mode": args.mode,
+                "vocab_size": actual_vocab,
+                "fit_bytes": len(fit_raw),
+            },
+        )
+        artifact.add_file(str(output_path), name="inspection.json")
+        run.log_artifact(artifact)
+
+    print(
+        f"\nWrote {output_path} and logged W&B artifact "
+        f"bunstall-{args.mode}-inspection"
+    )
 
 
 if __name__ == "__main__":
