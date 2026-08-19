@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -10,15 +9,6 @@ import wandb
 from tokenizer_experiment import ExperimentConfig, run_experiment
 
 ARTIFACTS_DIR = Path("artifacts")
-
-
-def parse_fractions(value: str) -> list[float]:
-    vals = [float(x) for x in value.split(",") if x.strip()]
-    if not vals or vals[-1] != 1.0:
-        raise argparse.ArgumentTypeError("fractions must end in 1.0")
-    if vals[0] <= 0 or any(a >= b for a, b in itertools.pairwise(vals)):
-        raise argparse.ArgumentTypeError("fractions must be increasing in (0, 1]")
-    return vals
 
 
 def parse_bunstall_modes(value: str) -> tuple[str, ...]:
@@ -33,7 +23,7 @@ def parse_bunstall_modes(value: str) -> tuple[str, ...]:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Compare tokenizer families by WikiText block-prequential codelength."
+        description="Compare tokenizer families by true online prequential codelength."
     )
     p.add_argument("--dataset-config", default="wikitext-2-raw-v1")
     p.add_argument("--vocab-size", type=int, default=4096)
@@ -48,21 +38,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--tokenizer-fit-mb", type=float, default=2.0)
     p.add_argument("--max-preq-mb", type=float, default=0.0)
-    p.add_argument(
-        "--fractions",
-        type=parse_fractions,
-        default=parse_fractions("0.01,0.02,0.04,0.08,0.16,0.32,0.64,1.0"),
-    )
     p.add_argument("--context", type=int, default=256)
     p.add_argument("--d-model", type=int, default=256)
     p.add_argument("--layers", type=int, default=4)
     p.add_argument("--heads", type=int, default=4)
     p.add_argument("--mlp-ratio", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.0)
-    p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument(
+        "--lr",
+        type=float,
+        default=1e-3,
+        help="AdamW learning rate; online default is deliberately aggressive.",
+    )
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=1337)
+    p.add_argument(
+        "--log-every",
+        type=int,
+        default=100,
+        help="Log telemetry every N datums; does not affect training or coding.",
+    )
     p.add_argument("--device", default=None)
     p.add_argument("--output", default=str(ARTIFACTS_DIR / "results.json"))
 
@@ -87,17 +82,16 @@ def main() -> None:
         "bunstall_modes": args.bunstall_modes,
         "tokenizer_fit_mb": args.tokenizer_fit_mb,
         "max_preq_mb": args.max_preq_mb,
-        "fractions": args.fractions,
         "context": args.context,
         "d_model": args.d_model,
         "layers": args.layers,
         "heads": args.heads,
         "mlp_ratio": args.mlp_ratio,
         "dropout": args.dropout,
-        "batch_size": args.batch_size,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "seed": args.seed,
+        "log_every": args.log_every,
     }
     if args.device is not None:
         kwargs["device"] = args.device
@@ -112,15 +106,16 @@ def main() -> None:
     curve_rows: list[list[object]] = []
     columns = [
         "model",
-        "stage",
+        "datum",
         "raw_bytes",
+        "cumulative_tokens",
         "cumulative_bits",
         "bits_per_byte",
-        "model_train_bytes",
-        "model_train_tokens",
-        "model_optimizer_steps",
-        "cumulative_optimizer_steps",
-        "cumulative_seconds",
+        "datum_bytes",
+        "datum_tokens",
+        "datum_bits_per_byte",
+        "optimizer_steps",
+        "elapsed_seconds",
     ]
 
     with wandb.init(
@@ -131,50 +126,52 @@ def main() -> None:
         dir=str(wandb_dir),
         config=asdict(config),
         save_code=True,
-        tags=["prequential", "tokenization", config.tunstall_mode, "bunstall"],
+        tags=["online-prequential", "tokenization", config.tunstall_mode, "bunstall"],
     ) as run:
 
-        def on_stage(model_name: str, stage: dict) -> None:
+        def on_progress(model_name: str, point: dict) -> None:
             key = model_name.replace("-", "_")
             row = [
                 model_name,
-                stage["stage"],
-                stage["cumulative_bytes"],
-                stage["cumulative_bits"],
-                stage["cumulative_bits_per_byte"],
-                stage["train_bytes"],
-                stage["train_tokens"],
-                stage["optimizer_steps"],
-                stage["cumulative_optimizer_steps"],
-                stage["cumulative_seconds"],
+                point["datum"],
+                point["cumulative_bytes"],
+                point["cumulative_tokens"],
+                point["cumulative_bits"],
+                point["cumulative_bits_per_byte"],
+                point["datum_bytes"],
+                point["datum_tokens"],
+                point["datum_bits_per_byte"],
+                point["optimizer_steps"],
+                point["elapsed_seconds"],
             ]
             curve_rows.append(row)
             run.log(
                 {
-                    f"{key}/stage": stage["stage"],
-                    f"{key}/raw_bytes": stage["cumulative_bytes"],
-                    f"{key}/cumulative_bits": stage["cumulative_bits"],
-                    f"{key}/cumulative_bits_per_byte": stage[
+                    f"{key}/datum": point["datum"],
+                    f"{key}/raw_bytes": point["cumulative_bytes"],
+                    f"{key}/cumulative_tokens": point["cumulative_tokens"],
+                    f"{key}/cumulative_bits": point["cumulative_bits"],
+                    f"{key}/cumulative_bits_per_byte": point[
                         "cumulative_bits_per_byte"
                     ],
-                    f"{key}/cumulative_optimizer_steps": stage[
-                        "cumulative_optimizer_steps"
-                    ],
-                    f"{key}/block_bits_per_byte": stage["bits_per_byte"],
+                    f"{key}/datum_bits_per_byte": point["datum_bits_per_byte"],
+                    f"{key}/optimizer_steps": point["optimizer_steps"],
                 }
             )
 
-        payload = run_experiment(config, on_stage=on_stage)
+        payload = run_experiment(config, on_progress=on_progress)
         output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
         results_artifact = wandb.Artifact(
             name="prequential-results",
             type="experiment-results",
-            description="Block-prequential tokenizer comparison results.",
+            description="True online prequential tokenizer comparison results.",
             metadata={
+                "protocol": "online-prequential",
                 "dataset_config": config.dataset_config,
                 "vocab_size": payload["metadata"]["actual_vocab_size"],
                 "seed": config.seed,
+                "lr": config.lr,
             },
         )
         results_artifact.add_file(str(output_path), name="results.json")
@@ -189,14 +186,14 @@ def main() -> None:
                     x="raw_bytes",
                     y="bits_per_byte",
                     stroke="model",
-                    title="Cumulative prequential bits / raw byte",
+                    title="Online prequential bits / raw byte",
                 ),
                 "code_curve/by_optimizer_steps": wandb.plot.line(
                     table,
-                    x="cumulative_optimizer_steps",
+                    x="optimizer_steps",
                     y="bits_per_byte",
                     stroke="model",
-                    title="Prequential code vs cumulative optimizer steps",
+                    title="Online prequential code vs optimizer steps",
                 ),
             }
         )
