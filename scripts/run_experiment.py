@@ -9,6 +9,8 @@ from pathlib import Path
 import wandb
 from tokenizer_experiment import ExperimentConfig, run_experiment
 
+ARTIFACTS_DIR = Path("artifacts")
+
 
 def parse_fractions(value: str) -> list[float]:
     vals = [float(x) for x in value.split(",") if x.strip()]
@@ -62,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--device", default=None)
-    p.add_argument("--output", default="results.json")
+    p.add_argument("--output", default=str(ARTIFACTS_DIR / "results.json"))
 
     p.add_argument("--wandb-project", default="tokenizer-experiment")
     p.add_argument("--wandb-entity", default=None)
@@ -101,6 +103,12 @@ def main() -> None:
         kwargs["device"] = args.device
     config = ExperimentConfig(**kwargs)
 
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wandb_dir = ARTIFACTS_DIR / "wandb"
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+
     curve_rows: list[list[object]] = []
     columns = [
         "model",
@@ -120,6 +128,7 @@ def main() -> None:
         entity=args.wandb_entity,
         name=args.wandb_run_name,
         mode=args.wandb_mode,
+        dir=str(wandb_dir),
         config=asdict(config),
         save_code=True,
         tags=["prequential", "tokenization", config.tunstall_mode, "bunstall"],
@@ -156,7 +165,7 @@ def main() -> None:
             )
 
         payload = run_experiment(config, on_stage=on_stage)
-        Path(args.output).write_text(json.dumps(payload, indent=2))
+        output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
         table = wandb.Table(columns=columns, data=curve_rows)
         run.log(
@@ -194,7 +203,7 @@ def main() -> None:
         bpb = result["prequential_bits_per_byte"]
         suffix = "" if result["name"] == "bpe" else f"  ({bpb - bpe_bpb:+.6f} vs BPE)"
         print(f"  {result['name']:20s} {bpb:.6f} bits/byte{suffix}")
-    print(f"\nWrote {args.output} (including per-model code_curve traces)")
+    print(f"\nWrote {output_path} (including per-model code_curve traces)")
 
 
 if __name__ == "__main__":
