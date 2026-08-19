@@ -77,7 +77,9 @@ def cap_utf8(raw: bytes, max_bytes: int) -> bytes:
 
 def tokenizer_stats(tokenizer, text: str) -> dict[str, Any]:
     ids = tokenizer.encode(text)
-    counts = np.bincount(np.asarray(ids, dtype=np.int64), minlength=tokenizer.vocab_size)
+    counts = np.bincount(
+        np.asarray(ids, dtype=np.int64), minlength=tokenizer.vocab_size
+    )
     probs = counts[counts > 0] / counts.sum()
     entropy = float(-(probs * np.log2(probs)).sum())
     raw_bytes = len(text.encode("utf-8"))
@@ -111,7 +113,9 @@ def run_experiment(
     raw = full_text.encode("utf-8")
     print(f"train split: {mb(len(raw)):.2f} MB UTF-8")
 
-    fit_raw, preq_raw = split_tokenizer_fit(raw, int(config.tokenizer_fit_mb * 1_000_000))
+    fit_raw, preq_raw = split_tokenizer_fit(
+        raw, int(config.tokenizer_fit_mb * 1_000_000)
+    )
     if config.max_preq_mb > 0:
         preq_raw = cap_utf8(preq_raw, int(config.max_preq_mb * 1_000_000))
     fit_text = fit_raw.decode("utf-8")
@@ -174,7 +178,10 @@ def run_experiment(
     )
 
     results = []
-    for name, tokenizer in [("bpe", bpe), (f"tunstall-{config.tunstall_mode}", tunstall)]:
+    for name, tokenizer in [
+        ("bpe", bpe),
+        (f"tunstall-{config.tunstall_mode}", tunstall),
+    ]:
         print(f"\n{'=' * 72}\nPREQUENTIAL: {name}\n{'=' * 72}")
         results.append(
             run_block_prequential(

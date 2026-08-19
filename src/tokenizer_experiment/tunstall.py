@@ -35,7 +35,9 @@ class EmpiricalTunstallTokenizer:
     Model vocabulary size: V = 1 + (256 + 255*k) = 257 + 255*k.
     """
 
-    def __init__(self, nodes: list[_Node], root: int, phrase_vocab_size: int, mode: str):
+    def __init__(
+        self, nodes: list[_Node], root: int, phrase_vocab_size: int, mode: str
+    ):
         self.nodes = nodes
         self.root = root
         self.phrase_vocab_size = phrase_vocab_size
@@ -72,7 +74,9 @@ class EmpiricalTunstallTokenizer:
         heap: list[tuple[float, int, int]] = []
         serial = 0
 
-        probs = counts.astype(np.float64) / max(1, counts.sum()) if mode == "iid" else None
+        probs = (
+            counts.astype(np.float64) / max(1, counts.sum()) if mode == "iid" else None
+        )
 
         for sym in range(BYTE_ALPHABET):
             node_id = len(nodes)
@@ -138,7 +142,9 @@ class EmpiricalTunstallTokenizer:
                         sorted_syms, return_index=True, return_counts=True
                     )
                     groups = {
-                        int(sym): sorted_pos[start : start + count].astype(np.int32, copy=True)
+                        int(sym): sorted_pos[start : start + count].astype(
+                            np.int32, copy=True
+                        )
                         for sym, start, count in zip(unique, starts, child_counts)
                     }
                 else:
@@ -224,7 +230,9 @@ class EmpiricalTunstallTokenizer:
                 out.append(node.token_id)
                 node_id = self.root
         if node_id != self.root:
-            raise ValueError("byte string ends inside a Tunstall phrase; align the boundary first")
+            raise ValueError(
+                "byte string ends inside a Tunstall phrase; align the boundary first"
+            )
         if add_eos:
             out.append(self.eos_id)
         return out
@@ -312,7 +320,9 @@ class BPETokenizer:
         from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
         tokenizer = Tokenizer(models.BPE(unk_token=None))
-        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+        tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(
+            add_prefix_space=False, use_regex=False
+        )
         tokenizer.decoder = decoders.ByteLevel()
         trainer = trainers.BpeTrainer(
             vocab_size=vocab_size,

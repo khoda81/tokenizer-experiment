@@ -7,7 +7,6 @@ from dataclasses import asdict
 from pathlib import Path
 
 import wandb
-
 from tokenizer_experiment import ExperimentConfig, run_experiment
 
 
@@ -108,6 +107,7 @@ def main() -> None:
         save_code=True,
         tags=["prequential", "tokenization", config.tunstall_mode],
     ) as run:
+
         def on_stage(model_name: str, stage: dict) -> None:
             key = model_name.replace("-", "_")
             row = [
@@ -128,7 +128,9 @@ def main() -> None:
                     f"{key}/stage": stage["stage"],
                     f"{key}/raw_bytes": stage["cumulative_bytes"],
                     f"{key}/cumulative_bits": stage["cumulative_bits"],
-                    f"{key}/cumulative_bits_per_byte": stage["cumulative_bits_per_byte"],
+                    f"{key}/cumulative_bits_per_byte": stage[
+                        "cumulative_bits_per_byte"
+                    ],
                     f"{key}/cumulative_optimizer_steps": stage[
                         "cumulative_optimizer_steps"
                     ],

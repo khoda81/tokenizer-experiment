@@ -66,7 +66,7 @@ def test_unaligned_finite_message_requires_boundary_alignment():
 
 
 def test_aligned_prequential_cuts_make_every_block_independently_encodable():
-    data = (("the λ quick brown fox\n" * 200).encode())
+    data = ("the λ quick brown fox\n" * 200).encode()
     tok = EmpiricalTunstallTokenizer.train(data, 4096, mode="boundary")
     cuts = tok.align_utf8_boundaries(data, [0.1, 0.25, 0.5, 1.0])
 
