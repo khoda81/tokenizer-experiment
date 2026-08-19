@@ -103,11 +103,6 @@ class CausalTransformer(nn.Module):
         self.norm = nn.LayerNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, vocab_size, bias=False)
 
-        # nn.Embedding defaults to N(0, 1). That is disastrous when its weight is
-        # reused as the output projection: after LayerNorm the initial logits have
-        # enormous variance and the untrained model is confidently random. Use the
-        # small embedding initialization common in decoder-only Transformers before
-        # tying input and output weights.
         nn.init.normal_(self.token.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.pos.weight, mean=0.0, std=0.02)
         self.head.weight = self.token.weight
@@ -198,9 +193,8 @@ def score_model(
         collate_fn=collate_windows,
         pin_memory=device.type == "cuda",
     )
-    # Every window predicts token 1..N from token 0..N-1. The first token of
-    # each independently encoded evaluation block needs a uniform code because
-    # this toy setup does not pass train-prefix context into scoring.
+    # Blocks are cut at token boundaries, but the model is not given context
+    # from the previous block. Send the first token under a uniform code.
     total_bits = math.log2(model.vocab_size)
     nats = 0.0
     start_time = time.perf_counter()
@@ -220,49 +214,24 @@ def score_model(
     return total_bits, time.perf_counter() - start_time
 
 
-def safe_utf8_boundaries(raw: bytes, fractions: list[float]) -> list[int]:
-    out: list[int] = []
-    prev = 0
-    for frac in fractions:
-        n = len(raw) if frac >= 1.0 else round(len(raw) * frac)
-        while n > prev:
-            try:
-                raw[prev:n].decode("utf-8")
-                break
-            except UnicodeDecodeError as exc:
-                # We only expect the cut to split the final UTF-8 codepoint.
-                if exc.end == len(raw[prev:n]):
-                    n -= 1
-                else:
-                    raise
-        if n <= prev and frac < 1.0:
-            raise ValueError("prequential boundary collapsed; use a larger corpus")
-        out.append(n)
-        prev = n
-    return out
-
-
 def run_block_prequential(
     *,
     name: str,
     tokenizer,
     raw: bytes,
-    fractions: list[float],
+    boundaries: list[int],
     model_cfg: ModelConfig,
     train_cfg: TrainConfig,
     device: torch.device,
 ) -> dict:
-    if not fractions or fractions[-1] != 1.0:
-        raise ValueError("fractions must end in 1.0")
-    if any(a >= b for a, b in itertools.pairwise(fractions)):
-        raise ValueError("fractions must be strictly increasing")
+    if not boundaries or boundaries[-1] > len(raw):
+        raise ValueError("invalid prequential boundaries")
+    if boundaries[0] <= 0 or any(a >= b for a, b in itertools.pairwise(boundaries)):
+        raise ValueError("prequential boundaries must be strictly increasing")
 
-    boundaries = safe_utf8_boundaries(raw, fractions)
-    actual_fractions = [b / len(raw) for b in boundaries]
+    actual_fractions = [b / boundaries[-1] for b in boundaries]
     vocab = tokenizer.vocab_size
 
-    # First block is transmitted with a uniform code, as in block-prequential
-    # coding before a learner has any observations.
     first = raw[: boundaries[0]].decode("utf-8")
     first_ids = tokenizer.encode(first)
     initial_bits = len(first_ids) * math.log2(vocab)
@@ -305,18 +274,10 @@ def run_block_prequential(
             f"score={(eval_end - train_end) / 1e6:.2f}MB ({len(eval_ids):,} tok)"
         )
         model, steps, train_seconds = train_model(
-            train_ids,
-            vocab,
-            model_cfg,
-            train_cfg,
-            device,
+            train_ids, vocab, model_cfg, train_cfg, device
         )
         bits, eval_seconds = score_model(
-            model,
-            eval_ids,
-            model_cfg.context,
-            device,
-            train_cfg.batch_size,
+            model, eval_ids, model_cfg.context, device, train_cfg.batch_size
         )
 
         cumulative_bits += bits
@@ -348,9 +309,6 @@ def run_block_prequential(
             f"steps={steps:,}; train {train_seconds:.1f}s; score {eval_seconds:.1f}s"
         )
 
-    # `code_curve` is deliberately redundant with `stages`: it is a stable,
-    # compact plotting interface for comparing prequential code against data,
-    # optimizer work, or elapsed training/scoring time without rerunning.
     code_curve = [
         {
             "stage": s.stage,
@@ -367,10 +325,12 @@ def run_block_prequential(
         for s in stages
     ]
 
+    encoded_bytes = boundaries[-1]
     return {
         "name": name,
         "prequential_bits": cumulative_bits,
-        "prequential_bits_per_byte": cumulative_bits / len(raw),
+        "prequential_bits_per_byte": cumulative_bits / encoded_bytes,
+        "encoded_bytes": encoded_bytes,
         "stages": [s.__dict__ for s in stages],
         "code_curve": code_curve,
     }
