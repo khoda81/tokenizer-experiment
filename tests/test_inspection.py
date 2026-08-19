@@ -1,6 +1,10 @@
 import pytest
 
-from tokenizer_experiment.inspection import binary_entropy, tunstall_split_rows
+from tokenizer_experiment.inspection import (
+    binary_entropy,
+    count_overlapping,
+    tunstall_split_rows,
+)
 from tokenizer_experiment.tunstall import EmpiricalTunstallTokenizer
 
 
@@ -9,6 +13,11 @@ def test_binary_entropy():
     assert binary_entropy(1.0) == 0.0
     assert binary_entropy(0.5) == pytest.approx(1.0)
     assert binary_entropy(0.25) == pytest.approx(binary_entropy(0.75))
+
+
+def test_count_overlapping_occurrences():
+    assert count_overlapping(b"aaaaa", b"aa") == 4
+    assert count_overlapping(b"banana", b"ana") == 2
 
 
 def test_tunstall_inspection_reports_one_row_per_expansion():
