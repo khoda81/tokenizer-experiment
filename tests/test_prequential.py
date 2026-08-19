@@ -4,7 +4,8 @@ import pytest
 import torch
 from torch import nn
 
-from prequential import CausalTransformer, ModelConfig, TokenWindows, score_model
+from tokenizer_experiment.model import CausalTransformer, ModelConfig
+from tokenizer_experiment.prequential import TokenWindows, score_model
 
 
 def test_token_windows_score_each_token_after_first_exactly_once():
