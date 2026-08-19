@@ -4,19 +4,20 @@ import pytest
 import torch
 from torch import nn
 
-from tokenizer_experiment.experiment import _group_tunstall_safe_rows
+from tokenizer_experiment.experiment import _shared_update_boundaries
 from tokenizer_experiment.model import CausalTransformer, ModelConfig
-from tokenizer_experiment.prequential import _online_datum_step
-from tokenizer_experiment.tunstall import EmpiricalTunstallTokenizer
+from tokenizer_experiment.prequential import _stream_update_step
 
 
-class BiasOnlyModel(nn.Module):
+class RecordingBiasModel(nn.Module):
     def __init__(self, vocab_size: int):
         super().__init__()
         self.vocab_size = vocab_size
         self.bias = nn.Parameter(torch.zeros(vocab_size))
+        self.inputs: list[list[int]] = []
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        self.inputs.append(ids[0].detach().cpu().tolist())
         batch, time = ids.shape
         return self.bias.view(1, 1, -1).expand(batch, time, -1)
 
@@ -31,62 +32,73 @@ class CountingSGD(torch.optim.SGD):
         return super().step(closure)
 
 
-def test_online_datum_scores_content_before_one_update_across_context_chunks():
+def test_stream_update_scores_before_one_step_and_keeps_prior_context():
     vocab_size = 17
-    model = BiasOnlyModel(vocab_size)
-    optimizer = CountingSGD(model.parameters(), lr=0.1)
-    ids = [1, 2, 3, 4, 5, 6, 7]
+    model = RecordingBiasModel(vocab_size)
+    optimizer = CountingSGD(model.parameters(), lr=0.0)
+    ids = [1, 2, 3, 4]
 
-    bits = _online_datum_step(
+    first_bits = _stream_update_step(
         model,
         optimizer,
         ids,
+        start_token=0,
+        end_token=2,
         bos_id=16,
-        context=3,
+        context=4,
+        device=torch.device("cpu"),
+    )
+    second_bits = _stream_update_step(
+        model,
+        optimizer,
+        ids,
+        start_token=2,
+        end_token=4,
+        bos_id=16,
+        context=4,
         device=torch.device("cpu"),
     )
 
-    # Every content token is scored while the model is still uniform. The known
-    # datum boundary is not charged as a synthetic EOS target.
-    assert bits == pytest.approx(len(ids) * math.log2(vocab_size), rel=1e-6)
-    assert optimizer.step_calls == 1
-    assert not torch.allclose(model.bias, torch.zeros_like(model.bias))
+    assert first_bits == pytest.approx(2 * math.log2(vocab_size), rel=1e-6)
+    assert second_bits == pytest.approx(2 * math.log2(vocab_size), rel=1e-6)
+    assert optimizer.step_calls == 2
+
+    # The second update is not a new sample. Its input window includes tokens
+    # from the first update; BOS appears only because the whole stream is still
+    # shorter than the model context.
+    assert model.inputs[0] == [16, 1]
+    assert model.inputs[1] == [16, 1, 2, 3]
 
 
-def test_empty_content_datum_is_rejected():
-    model = BiasOnlyModel(7)
-    optimizer = CountingSGD(model.parameters(), lr=0.1)
+def test_large_update_accumulates_chunks_before_single_step():
+    vocab_size = 11
+    model = RecordingBiasModel(vocab_size)
+    optimizer = CountingSGD(model.parameters(), lr=0.0)
+    ids = [i % 10 for i in range(9)]
 
-    with pytest.raises(ValueError, match="at least one token"):
-        _online_datum_step(
-            model,
-            optimizer,
-            [],
-            bos_id=6,
-            context=4,
-            device=torch.device("cpu"),
-        )
-
-    assert optimizer.step_calls == 0
-
-
-def test_tunstall_row_grouping_closes_at_every_earliest_legal_boundary():
-    # With one 256-way expansion on an all-'a' corpus, the byte 'a' is expanded
-    # and therefore needs a second byte before a Tunstall phrase completes.
-    tokenizer = EmpiricalTunstallTokenizer.train(
-        b"a" * 100,
-        requested_vocab_size=512,
-        mode="boundary",
+    bits = _stream_update_step(
+        model,
+        optimizer,
+        ids,
+        start_token=0,
+        end_token=len(ids),
+        bos_id=10,
+        context=4,
+        device=torch.device("cpu"),
     )
-    rows = [b"a", b"a", b"a", b"a"]
 
-    datums, rows_per_datum, dropped = _group_tunstall_safe_rows(rows, tokenizer)
+    assert bits == pytest.approx(len(ids) * math.log2(vocab_size), rel=1e-6)
+    assert len(model.inputs) > 1
+    assert optimizer.step_calls == 1
 
-    assert datums == [b"aa", b"aa"]
-    assert rows_per_datum == [2, 2]
-    assert dropped == 0
-    for datum in datums:
-        tokenizer.encode_bytes(datum)
+
+def test_shared_update_boundaries_follow_raw_milestones():
+    offsets = {
+        "a": [0, 100, 256, 300, 512, 768, 1000],
+        "b": [0, 128, 256, 400, 512, 700, 768, 1000],
+    }
+
+    assert _shared_update_boundaries(offsets, 250) == [256, 512, 768, 1000]
 
 
 def test_transformer_uses_small_tied_embedding_initialization():
