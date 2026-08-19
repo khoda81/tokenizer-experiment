@@ -58,32 +58,35 @@ def _online_datum_step(
     optimizer: torch.optim.Optimizer,
     ids: list[int],
     *,
-    eos_id: int,
+    bos_id: int,
     context: int,
     device: torch.device,
 ) -> float:
     """Measure one datum's NLL, then update once from that exact loss.
 
-    EOS is used as both the start-of-datum context and the termination target:
+    Datum boundaries are side information supplied by the dataset protocol, so
+    they are not coded as synthetic EOS targets. The tokenizer's reserved EOS
+    embedding is reused only as a fixed start-of-datum/BOS context:
 
-        <EOS> token_0 ... token_n <EOS>
+        <BOS> token_0 ... token_n
 
     Long datums are evaluated in context-sized chunks. Gradients from all chunks
     are accumulated before the single optimizer step, so every probability used
     in the prequential code comes from the model state *before* this datum is
     learned.
     """
-    sequence = [eos_id, *ids, eos_id]
-    predictions = len(sequence) - 1
-    if predictions <= 0:
-        raise AssertionError("datum must have at least the EOS target")
+    if not ids:
+        raise ValueError("online datum must contain at least one token")
+
+    sequence = [bos_id, *ids]
+    predictions = len(ids)
 
     optimizer.zero_grad(set_to_none=True)
     model.train()
     total_nats = 0.0
 
-    # Each target is scored exactly once. Context resets only for unusually long
-    # datums that exceed the model's token context; the optimizer still steps
+    # Each content token is scored exactly once. Context resets only for unusually
+    # long datums that exceed the model's token context; the optimizer still steps
     # exactly once for the whole datum.
     for start in range(0, predictions, context):
         end = min(start + context, predictions)
@@ -149,7 +152,7 @@ def run_online_prequential(
             model,
             optimizer,
             ids,
-            eos_id=tokenizer.eos_id,
+            bos_id=tokenizer.eos_id,
             context=model_cfg.context,
             device=device,
         )
