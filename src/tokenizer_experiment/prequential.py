@@ -53,6 +53,17 @@ def autocast_context(device: torch.device):
     return torch.autocast(device_type="cpu", enabled=False)
 
 
+def _input_window(
+    ids: list[int], *, x_start: int, x_end: int, bos_id: int
+) -> list[int]:
+    """Return conceptual ``[BOS, *ids][x_start:x_end]`` without copying ids."""
+    if x_start == 0:
+        if x_end <= 0:
+            return []
+        return [bos_id, *ids[: x_end - 1]]
+    return ids[x_start - 1 : x_end - 1]
+
+
 def _stream_update_step(
     model: CausalTransformer,
     optimizer: torch.optim.Optimizer,
@@ -82,7 +93,6 @@ def _stream_update_step(
     if context < 2:
         raise ValueError("context must be at least 2")
 
-    sequence = [bos_id, *ids]
     update_tokens = end_token - start_token
     max_new_tokens = max(1, context // 2)
 
@@ -94,14 +104,12 @@ def _stream_update_step(
         chunk_end = min(chunk_start + max_new_tokens, end_token)
         new_tokens = chunk_end - chunk_start
 
-        # sequence position q predicts q+1. Ending x at `chunk_end` makes its
-        # final logit predict ids[chunk_end-1]. Keep as much preceding stream
-        # context as fits while reserving room for all new targets in this chunk.
+        # Conceptual sequence position q in [BOS, *ids] predicts q+1. Ending x
+        # at `chunk_end` makes its final logit predict ids[chunk_end-1].
         x_end = chunk_end
         x_start = max(0, x_end - context)
-        x = torch.tensor(
-            sequence[x_start:x_end], dtype=torch.long, device=device
-        )[None, :]
+        x_values = _input_window(ids, x_start=x_start, x_end=x_end, bos_id=bos_id)
+        x = torch.tensor(x_values, dtype=torch.long, device=device)[None, :]
         targets = torch.tensor(
             ids[chunk_start:chunk_end], dtype=torch.long, device=device
         )[None, :]
