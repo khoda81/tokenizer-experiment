@@ -19,14 +19,30 @@ def parse_fractions(value: str) -> list[float]:
     return vals
 
 
+def parse_bunstall_modes(value: str) -> tuple[str, ...]:
+    modes = tuple(x.strip() for x in value.split(",") if x.strip())
+    invalid = set(modes) - {"entropy", "frequency"}
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"unknown Bunstall modes: {', '.join(sorted(invalid))}"
+        )
+    return modes
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Compare BPE vs Tunstall-style tokens by WikiText block-prequential codelength."
+        description="Compare tokenizer families by WikiText block-prequential codelength."
     )
     p.add_argument("--dataset-config", default="wikitext-2-raw-v1")
     p.add_argument("--vocab-size", type=int, default=4096)
     p.add_argument(
         "--tunstall-mode", choices=["boundary", "empirical", "iid"], default="boundary"
+    )
+    p.add_argument(
+        "--bunstall-modes",
+        type=parse_bunstall_modes,
+        default=parse_bunstall_modes("entropy,frequency"),
+        help="Comma-separated Bunstall modes to include; empty string disables Bunstall.",
     )
     p.add_argument("--tokenizer-fit-mb", type=float, default=2.0)
     p.add_argument("--max-preq-mb", type=float, default=0.0)
@@ -66,6 +82,7 @@ def main() -> None:
         "dataset_config": args.dataset_config,
         "vocab_size": args.vocab_size,
         "tunstall_mode": args.tunstall_mode,
+        "bunstall_modes": args.bunstall_modes,
         "tokenizer_fit_mb": args.tokenizer_fit_mb,
         "max_preq_mb": args.max_preq_mb,
         "fractions": args.fractions,
@@ -105,7 +122,7 @@ def main() -> None:
         mode=args.wandb_mode,
         config=asdict(config),
         save_code=True,
-        tags=["prequential", "tokenization", config.tunstall_mode],
+        tags=["prequential", "tokenization", config.tunstall_mode, "bunstall"],
     ) as run:
 
         def on_stage(model_name: str, stage: dict) -> None:
@@ -162,25 +179,21 @@ def main() -> None:
             }
         )
 
+        bpe_result = next(result for result in payload["results"] if result["name"] == "bpe")
+        bpe_bpb = bpe_result["prequential_bits_per_byte"]
         for result in payload["results"]:
             name = result["name"].replace("-", "_")
-            run.summary[f"final/{name}_bits_per_byte"] = result[
-                "prequential_bits_per_byte"
-            ]
-        delta = (
-            payload["results"][1]["prequential_bits_per_byte"]
-            - payload["results"][0]["prequential_bits_per_byte"]
-        )
-        run.summary["final/tunstall_minus_bpe_bits_per_byte"] = delta
+            bpb = result["prequential_bits_per_byte"]
+            run.summary[f"final/{name}_bits_per_byte"] = bpb
+            if result["name"] != "bpe":
+                run.summary[f"final/{name}_minus_bpe_bits_per_byte"] = bpb - bpe_bpb
         run.summary["metadata"] = payload["metadata"]
 
     print("\nFINAL")
     for result in payload["results"]:
-        print(
-            f"  {result['name']:20s} "
-            f"{result['prequential_bits_per_byte']:.6f} bits/byte"
-        )
-    print(f"  Tunstall - BPE       {delta:+.6f} bits/byte")
+        bpb = result["prequential_bits_per_byte"]
+        suffix = "" if result["name"] == "bpe" else f"  ({bpb - bpe_bpb:+.6f} vs BPE)"
+        print(f"  {result['name']:20s} {bpb:.6f} bits/byte{suffix}")
     print(f"\nWrote {args.output} (including per-model code_curve traces)")
 
 
