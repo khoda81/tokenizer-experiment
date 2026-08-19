@@ -10,11 +10,13 @@ The first experiment compares byte-level BPE with a prefix-free Tunstall-style b
 src/tokenizer_experiment/
   model.py          reusable Transformer
   tunstall.py       BPE and Tunstall tokenizers
+  inspection.py     tokenizer structure diagnostics
   prequential.py    one-pass block-prequential evaluation
   experiment.py     reusable WikiText experiment orchestration
 
 scripts/
-  run_experiment.py runnable CLI + W&B integration
+  run_experiment.py      runnable CLI + W&B integration
+  inspect_tokenizers.py  inspect learned tokens and branching structure
 
 docs/experiments/
   001-bpe-vs-tunstall-wikitext2.md
@@ -48,6 +50,24 @@ uv run python scripts/run_experiment.py --wandb-mode offline
 # Disable W&B entirely; results.json is still written
 uv run python scripts/run_experiment.py --wandb-mode disabled
 ```
+
+## Inspect the learned tokenizers
+
+The inspection run trains only the tokenizers, not the Transformer:
+
+```bash
+uv run python scripts/inspect_tokenizers.py
+```
+
+It prints and writes `tokenizer-inspection.json` containing:
+
+- the most frequent emitted Tunstall and BPE tokens,
+- every expanded Tunstall prefix and its observed 256-way next-byte distribution,
+- the next-byte entropy and effective branching factor of each Tunstall expansion,
+- learned BPE merges viewed as approximate binary continuation tests `A+B` versus `A+[not B]`,
+- the binary entropy of those BPE splits and summary statistics over supported merges.
+
+This is intended to test the hypothesis that BPE spends one vocabulary slot at a time on sparse binary refinements while a byte-level Tunstall expansion spends 255 extra leaves at once.
 
 ## Default experiment
 
