@@ -91,7 +91,7 @@ def main() -> None:
         "--vocab-size",
         type=int,
         default=4096,
-        help="Requested size; snapped to 257 + 256k.",
+        help="Requested model vocab; snapped to 257 + 255k (byte-tree leaves + separate EOS).",
     )
     p.add_argument(
         "--tunstall-mode", choices=["boundary", "empirical", "iid"], default="boundary"
@@ -107,7 +107,7 @@ def main() -> None:
         "--fractions",
         type=parse_fractions,
         default=parse_fractions("0.01,0.02,0.04,0.08,0.16,0.32,0.64,1.0"),
-        help="Block endpoints. Defaults to logarithmic checkpoints for a useful learning curve.",
+        help="Block endpoints. Defaults to logarithmic checkpoints for the stored code curve.",
     )
     p.add_argument("--context", type=int, default=256)
     p.add_argument("--d-model", type=int, default=256)
@@ -129,12 +129,11 @@ def main() -> None:
 
     actual_vocab = EmpiricalTunstallTokenizer.legal_vocab_size(args.vocab_size)
     print(
-        f"Requested vocab {args.vocab_size}; using exact shared vocab {actual_vocab} (= 257 + 256k)"
+        f"Requested vocab {args.vocab_size}; using exact shared model vocab {actual_vocab} "
+        f"(= 257 + 255k: prefix-free byte leaves + one separate EOS token)"
     )
     print(f"Loading Salesforce/wikitext / {args.dataset_config} ...")
     ds = load_dataset("Salesforce/wikitext", args.dataset_config, split="train")
-    # Preserve blank rows and explicit row boundaries. Both tokenizers see the
-    # exact same UTF-8 stream.
     full_text = "\n".join(ds["text"])
     raw = full_text.encode("utf-8")
     print(f"train split: {mb(len(raw)):.2f} MB UTF-8")
@@ -144,9 +143,8 @@ def main() -> None:
     if args.max_preq_mb > 0:
         preq_raw = cap_utf8(preq_raw, int(args.max_preq_mb * 1_000_000))
     fit_text = fit_raw.decode("utf-8")
-    preq_text = preq_raw.decode("utf-8")
     print(
-        f"tokenizer fit: {mb(len(fit_raw)):.2f} MB; prequential stream: {mb(len(preq_raw)):.2f} MB"
+        f"tokenizer fit: {mb(len(fit_raw)):.2f} MB; candidate prequential stream: {mb(len(preq_raw)):.2f} MB"
     )
 
     print(f"\nTraining {args.tunstall_mode} Tunstall-style tokenizer ...")
@@ -158,15 +156,31 @@ def main() -> None:
     )
     tunstall.assert_prefix_free()
     print(
-        f"Tunstall tokenizer built in {time.perf_counter() - t0:.1f}s; max phrase={tunstall.max_phrase_bytes()} bytes"
+        f"Tunstall tokenizer built in {time.perf_counter() - t0:.1f}s; "
+        f"phrase leaves={tunstall.phrase_vocab_size}; max phrase={tunstall.max_phrase_bytes()} bytes"
     )
+
+    # A byte-only prefix-free phrase tree cannot flush an arbitrary partial
+    # phrase at a finite message boundary. Move every requested prequential cut
+    # slightly backward to a completed Tunstall phrase that is also a UTF-8
+    # boundary. BPE uses these exact same raw byte ranges.
+    boundaries = tunstall.align_utf8_boundaries(preq_raw, args.fractions)
+    encoded_end = boundaries[-1]
+    dropped_tail = len(preq_raw) - encoded_end
+    preq_raw = preq_raw[:encoded_end]
+    preq_text = preq_raw.decode("utf-8")
+    print(
+        f"aligned prequential stream: {mb(encoded_end):.2f} MB; "
+        f"dropped trailing partial phrase={dropped_tail} bytes"
+    )
+    print("aligned cuts (MB): " + ", ".join(f"{b / 1e6:.3f}" for b in boundaries))
 
     print("\nTraining byte-level BPE tokenizer ...")
     t0 = time.perf_counter()
     bpe = BPETokenizer.train(fit_text, vocab_size=actual_vocab)
     print(f"BPE tokenizer built in {time.perf_counter() - t0:.1f}s")
 
-    print("\nTokenizer diagnostics on the prequential stream:")
+    print("\nTokenizer diagnostics on the aligned prequential stream:")
     tun_stats = tokenizer_stats(tunstall, preq_text)
     bpe_stats = tokenizer_stats(bpe, preq_text)
     for name, stats in [("tunstall", tun_stats), ("bpe", bpe_stats)]:
@@ -198,7 +212,7 @@ def main() -> None:
             name=name,
             tokenizer=tokenizer,
             raw=preq_raw,
-            fractions=args.fractions,
+            boundaries=boundaries,
             model_cfg=model_cfg,
             train_cfg=train_cfg,
             device=device,
@@ -210,10 +224,13 @@ def main() -> None:
         "dataset_config": args.dataset_config,
         "requested_vocab_size": args.vocab_size,
         "actual_vocab_size": actual_vocab,
+        "tunstall_phrase_vocab_size": tunstall.phrase_vocab_size,
+        "eos_is_separate_token": True,
         "tunstall_mode": args.tunstall_mode,
         "tokenizer_fit_bytes": len(fit_raw),
         "prequential_bytes": len(preq_raw),
-        "fractions": args.fractions,
+        "requested_fractions": args.fractions,
+        "aligned_boundaries": boundaries,
         "model": asdict(model_cfg),
         "training": asdict(train_cfg),
         "training_passes_per_prefix": 1,
