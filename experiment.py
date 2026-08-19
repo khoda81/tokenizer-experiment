@@ -98,12 +98,16 @@ def main() -> None:
     )
     p.add_argument("--tokenizer-fit-mb", type=float, default=2.0)
     p.add_argument(
-        "--max-preq-mb", type=float, default=4.0, help="0 = all remaining train bytes"
+        "--max-preq-mb",
+        type=float,
+        default=0.0,
+        help="Maximum prequential-stream size in MB; 0 (default) uses all remaining train bytes.",
     )
     p.add_argument(
         "--fractions",
         type=parse_fractions,
-        default=parse_fractions("0.05,0.15,0.35,0.65,1.0"),
+        default=parse_fractions("0.01,0.02,0.04,0.08,0.16,0.32,0.64,1.0"),
+        help="Block endpoints. Defaults to logarithmic checkpoints for a useful learning curve.",
     )
     p.add_argument("--context", type=int, default=256)
     p.add_argument("--d-model", type=int, default=256)
@@ -112,15 +116,8 @@ def main() -> None:
     p.add_argument("--mlp-ratio", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=0.1)
-    p.add_argument(
-        "--max-train-steps",
-        type=int,
-        default=0,
-        help="0 = full epochs; useful for smoke tests",
-    )
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--output", default="results.json")
@@ -189,10 +186,8 @@ def main() -> None:
     )
     train_cfg = TrainConfig(
         batch_size=args.batch_size,
-        epochs=args.epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
-        max_train_steps=args.max_train_steps,
         seed=args.seed,
     )
 
@@ -221,6 +216,7 @@ def main() -> None:
         "fractions": args.fractions,
         "model": asdict(model_cfg),
         "training": asdict(train_cfg),
+        "training_passes_per_prefix": 1,
         "device": str(device),
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
         "torch": torch.__version__,
@@ -242,7 +238,7 @@ def main() -> None:
         - results[0]["prequential_bits_per_byte"]
     )
     print(f"  Tunstall - BPE       {delta:+.6f} bits/byte")
-    print(f"\nWrote {args.output}")
+    print(f"\nWrote {args.output} (including per-model code_curve traces)")
 
 
 if __name__ == "__main__":
