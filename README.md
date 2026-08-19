@@ -1,10 +1,10 @@
 # Tokenizer experiment
 
-Small controlled experiments comparing tokenizers by **online prequential codelength in bits per raw UTF-8 byte**.
+Small controlled experiments comparing tokenizers by **continuous-stream online prequential codelength in bits per raw UTF-8 byte**.
 
 The experiments compare byte-level BPE, prefix-free Tunstall-style byte phrases, and sparse-prefix ("Bunstall") tokenizers using the same flat-softmax Transformer.
 
-> Experiments 001 and 003 used an earlier geometric **block-prequential** evaluator. Those model results are retained as legacy diagnostics but are not the intended online-prequential measurement.
+> Earlier runs used either geometric block-prequential evaluation or persistent weights with the Transformer context reset at every dataset row. Those model results are legacy diagnostics, not the intended compressor-like prequential measurement.
 
 ## Layout
 
@@ -14,7 +14,7 @@ src/tokenizer_experiment/
   tunstall.py       BPE and Tunstall tokenizers
   sparse_prefix.py  sparse-prefix / Bunstall tokenizer
   inspection.py     tokenizer structure diagnostics
-  prequential.py    online datum-by-datum prequential evaluation
+  prequential.py    continuous-stream online prequential evaluation
   experiment.py     reusable WikiText experiment orchestration
 
 scripts/
@@ -34,31 +34,29 @@ tests/
 .github/workflows/ci.yml
 ```
 
-Reusable logic belongs under `src/tokenizer_experiment`. Scripts should be thin entry points around that package.
+## Continuous prequential protocol
 
-## Correct online-prequential protocol
+The measured corpus is one continuous conditional sequence, not a collection of independent model samples. For WikiText we preserve the exact newline-joined raw text stream; row boundaries do not reset attention context.
 
-The model is initialized once and walks through the stream exactly once:
+Each tokenizer tokenizes that entire stream **once**. Optimizer updates happen near fixed raw-byte milestones, moved only to positions that are token boundaries for every tokenizer. Those update positions decide when the compressor may learn; they do not retokenize the text or reset autoregressive context.
+
+Conceptually:
 
 ```python
-for datum in stream:
-    loss = model.loss(datum)   # probability before learning this datum
+ids = tokenizer.encode(whole_stream)
+
+for raw_segment in shared_update_segments:
+    loss = model.nll(new_tokens, context=preceding_stream_tokens)
     prequential_bits += loss
     loss.backward()
-    optimizer.step()           # exactly one update for this datum
+    optimizer.step()
 ```
 
-There is no held-out scoring pass, no geometric blocking, no retraining from scratch, and no second epoch. Batch size is one **raw datum**.
+The model is initialized once, sees the stream in order exactly once, and never scores a token after learning from that token. There is no held-out score pass, no prefix retraining, and no second epoch.
 
-The default datums are as fine-grained as possible while remaining identical for every tokenizer: start from individual WikiText dataset rows and greedily merge adjacent rows only when necessary for a prefix-free Tunstall phrase to terminate at the datum boundary.
+The reserved special-token embedding is used only as BOS for the first token of the entire stream. There is no synthetic EOS/BOS at row or optimizer boundaries.
 
-Each datum is scored as:
-
-```text
-<EOS-as-BOS> content tokens
-```
-
-The reserved EOS embedding is reused only as fixed start-of-datum context so the first content token is predicted by the model. Datum boundaries are already known side information and are **not** charged as synthetic EOS targets; the raw row separator itself is present as its literal newline byte. If an unusually long datum exceeds the 256-token model context, its loss is accumulated over context-sized chunks and the optimizer still steps only once after the complete datum has been scored.
+With context 256, large update segments are scored in subchunks of at most 128 new tokens. Each forward window therefore keeps as much preceding stream history as fits, and all subchunk gradients are accumulated before the single optimizer step for that raw segment.
 
 ## Run
 
@@ -67,34 +65,45 @@ uv sync --extra dev
 uv run python scripts/run_experiment.py
 ```
 
-Defaults include:
+Defaults:
 
+- target 256 raw bytes per optimizer update,
+- actual update positions shared by every tokenizer,
+- context 256 tokens,
 - one persistent model per tokenizer,
-- batch size one datum,
-- exactly one pass over the ordered stream,
-- AdamW learning rate `1e-3`, deliberately aggressive for online learning,
-- W&B telemetry every 100 datums; logging frequency does not affect the code.
+- one pass over the continuous stream,
+- AdamW learning rate `1e-3`, weight decay `0.1`,
+- experimental tokenizers run before established baselines.
 
-Useful W&B options:
-
-```bash
-# Explicit project / run name
-uv run python scripts/run_experiment.py \
-  --wandb-project tokenizer-experiment \
-  --wandb-run-name online-bunstall-uniformity
-
-# Keep W&B data local for later syncing
-uv run python scripts/run_experiment.py --wandb-mode offline
-
-# Disable W&B entirely; the local staged JSON is still written
-uv run python scripts/run_experiment.py --wandb-mode disabled
-```
-
-When the Hugging Face dataset is already cached and network access is flaky, skip Hub requests entirely:
+Useful options:
 
 ```bash
-HF_HUB_OFFLINE=1 uv run python scripts/run_experiment.py --wandb-mode offline
+HF_HUB_OFFLINE=1 uv run python scripts/run_experiment.py \
+  --wandb-mode offline \
+  --wandb-run-name continuous-prequential-rerun
+
+# Change learning cadence without changing model context.
+uv run python scripts/run_experiment.py --update-bytes 128
 ```
+
+## Crash-safe progress
+
+Generated state lives under gitignored `artifacts/`:
+
+```text
+artifacts/
+  results.partial.json   atomically rewritten during the run
+  results.json           complete result after a clean finish
+  tokenizer-inspection.json
+  bunstall-inspection.json
+  wandb/
+```
+
+`results.partial.json` is rewritten every telemetry checkpoint (100 updates by default). If Python receives an interruption, the file is marked `interrupted` before exit when possible.
+
+Every 1,000 optimizer updates, the current partial JSON is also logged as a new version of the W&B Artifact `prequential-progress`. A clean run logs `prequential-results` with the complete result. These checkpoint cadences are bookkeeping only and do not affect model training or codelength.
+
+The progress `mb` value is cumulative **raw UTF-8 megabytes encoded**, so every tokenizer should end at exactly the same MB value. Token counts differ by tokenizer.
 
 ## Inspect the learned tokenizers
 
@@ -108,53 +117,17 @@ uv run python scripts/inspect_bunstall.py --mode frequency
 
 The BPE/Tunstall inspection logs the W&B Artifact `bpe-tunstall-inspection`. Bunstall inspections log `bunstall-entropy-inspection` or `bunstall-frequency-inspection`.
 
-Inspection output includes:
-
-- the most frequent emitted tokens, with visible whitespace glyphs,
-- expanded Tunstall prefixes and their observed 256-way continuation distributions,
-- next-byte entropy and effective branching factor,
-- learned BPE merges viewed as approximate binary continuation tests,
-- Bunstall promoted continuations and their binary split statistics.
+Inspection output includes representative emitted tokens with visible whitespace, Tunstall fanouts, BPE continuation diagnostics, and Bunstall promoted-continuation statistics.
 
 ## Default experiment
 
 - WikiText-2 raw.
-- Roughly the first 2 MB of **complete dataset rows** fit the tokenizers and are treated as shared side information.
-- All remaining complete rows form the candidate online stream.
-- Requested vocabulary ~4096; the byte-only Tunstall tree plus separate reserved start token snaps this to 4082.
+- Roughly the first 2 MB of complete rows fit the tokenizers and are shared side information.
+- The remaining ~8.95 MB is one continuous raw stream.
+- Requested vocabulary ~4096; the shared legal model vocabulary is 4082.
 - Same 4-layer, 256-wide Transformer for every tokenizer.
-- Context 256 tokens.
-- One model initialization, one ordered pass, one optimizer update per raw datum.
-- Learning rate `1e-3` by default.
-- New/experimental tokenizer variants run before established baselines so obviously bad experiments can be stopped early.
-- BPE, Tunstall-boundary, Bunstall-entropy, and Bunstall-frequency are compared on exactly the same raw datums.
-
-## Outputs and W&B Artifacts
-
-Generated local state is staged under `artifacts/`, which is gitignored:
-
-```text
-artifacts/
-  results.json
-  tokenizer-inspection.json
-  bunstall-inspection.json
-  wandb/
-```
-
-The local JSON files are useful for immediate inspection, but **W&B Artifacts are the persistent experiment record**. Repeated logs of the same artifact collection create versioned outputs associated with their producing runs.
-
-`prequential-results` contains the machine-readable online result with protocol metadata, final prequential code, tokenizer diagnostics, datum counts, and a compact `code_curve` sampled every logging interval with:
-
-- datum / optimizer step,
-- cumulative raw bytes and tokens,
-- cumulative bits and bits/byte,
-- current datum bits/byte,
-- elapsed wall time.
-
-## Experiments
-
-See `docs/experiments/` for recorded hypotheses, setups, results, and explicit legacy labels.
+- Bunstall-frequency, Bunstall-entropy, BPE, then Tunstall-boundary run in that order by default.
 
 ## CI
 
-GitHub Actions installs the package with `uv`, runs Ruff, and runs the CPU unit tests. CI intentionally does **not** download WikiText or run the GPU experiment.
+GitHub Actions installs the package with `uv`, runs Ruff, and runs CPU unit tests. CI intentionally does not download WikiText or run the GPU experiment.
