@@ -5,13 +5,12 @@ import itertools
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from itertools import chain
 from typing import Literal
 
 import numpy as np
 
-EOS = 256
-ALPHABET = 257  # 256 bytes + an end-of-message symbol
+BYTE_ALPHABET = 256
+EOS_TOKEN = 256  # conceptual symbol only; EOS is not a Tunstall-tree branch
 
 
 @dataclass
@@ -28,45 +27,55 @@ class _Node:
     def is_leaf(self) -> bool:
         return self.children is None
 
-    @property
-    def contains_eos(self) -> bool:
-        return EOS in self.phrase
-
 
 class EmpiricalTunstallTokenizer:
-    """A complete prefix-free phrase tokenizer over bytes.
+    """A prefix-free phrase tokenizer whose tree contains bytes only.
 
-    The tree begins with one leaf per byte plus EOS. Repeatedly, the most
-    probable current leaf is replaced by all 257 one-symbol continuations.
+    The phrase tree begins with one leaf per byte. Repeatedly, the selected leaf
+    is replaced by all 256 one-byte continuations, so each expansion adds 255
+    phrase tokens. EOS is one separate model token and is *not* a branch in the
+    phrase tree.
+
+    Therefore the model vocabulary size is::
+
+        V = 1 + (256 + 255*k) = 257 + 255*k
 
     `mode="iid"` is classical Tunstall under an empirical IID byte source.
-    `mode="boundary"` is the default experiment: retokenize the fit corpus,
-    expand the most frequent *actually emitted* leaf, and repeat. It directly
-    chases a flatter context-free token marginal.
-    `mode="empirical"` is a faster phrase-prefix-frequency variant using
-    occurrences at arbitrary byte positions. Neither non-IID mode is claimed
-    to be an optimal generalized Tunstall code.
+    `mode="boundary"` retokenizes the fit corpus and expands the most frequent
+    actually-emitted leaf. `mode="empirical"` uses arbitrary-position phrase
+    frequency as a faster approximation.
 
-    EOS is never expanded. Therefore every finite byte string can be encoded:
-    append EOS, walk the tree until a leaf, emit it, and restart at the root.
+    A finite byte string can end part-way through an internal phrase. The
+    experiment avoids inventing flush tokens: prequential block endpoints are
+    aligned to completed Tunstall phrases. At such a boundary EOS, if desired,
+    is simply the separate `eos_id` token.
     """
 
-    def __init__(self, nodes: list[_Node], root: int, vocab_size: int, mode: str):
+    def __init__(
+        self,
+        nodes: list[_Node],
+        root: int,
+        phrase_vocab_size: int,
+        mode: str,
+    ):
         self.nodes = nodes
         self.root = root
-        self.vocab_size = vocab_size
+        self.phrase_vocab_size = phrase_vocab_size
+        self.eos_id = phrase_vocab_size
+        self.vocab_size = phrase_vocab_size + 1
         self.mode = mode
-        self._id_to_phrase: list[tuple[int, ...]] = [()] * vocab_size
+        self._id_to_phrase: list[tuple[int, ...]] = [()] * phrase_vocab_size
         for node in nodes:
             if node.token_id is not None:
                 self._id_to_phrase[node.token_id] = node.phrase
 
     @staticmethod
     def legal_vocab_size(requested: int) -> int:
-        if requested < ALPHABET:
-            raise ValueError(f"vocab_size must be >= {ALPHABET}")
-        k = max(0, round((requested - ALPHABET) / (ALPHABET - 1)))
-        return ALPHABET + k * (ALPHABET - 1)
+        """Nearest legal *model* vocab: one EOS plus a full 256-ary leaf set."""
+        if requested < BYTE_ALPHABET + 1:
+            raise ValueError(f"vocab_size must be >= {BYTE_ALPHABET + 1}")
+        k = max(0, round((requested - (BYTE_ALPHABET + 1)) / (BYTE_ALPHABET - 1)))
+        return BYTE_ALPHABET + 1 + k * (BYTE_ALPHABET - 1)
 
     @classmethod
     def train(
@@ -75,12 +84,11 @@ class EmpiricalTunstallTokenizer:
         requested_vocab_size: int,
         mode: Literal["boundary", "empirical", "iid"] = "boundary",
     ) -> EmpiricalTunstallTokenizer:
-        target = cls.legal_vocab_size(requested_vocab_size)
-        symbols = np.empty(len(data) + 1, dtype=np.uint16)
-        symbols[:-1] = np.frombuffer(data, dtype=np.uint8)
-        symbols[-1] = EOS
+        model_vocab_size = cls.legal_vocab_size(requested_vocab_size)
+        phrase_target = model_vocab_size - 1
+        symbols = np.frombuffer(data, dtype=np.uint8)
+        counts = np.bincount(symbols.astype(np.int64), minlength=BYTE_ALPHABET)
 
-        counts = np.bincount(symbols.astype(np.int64), minlength=ALPHABET)
         nodes: list[_Node] = [_Node(phrase=(), count=len(symbols), children=[])]
         root = 0
         root_children: list[int] = []
@@ -88,36 +96,34 @@ class EmpiricalTunstallTokenizer:
         serial = 0
 
         if mode == "iid":
-            probs = counts.astype(np.float64) / counts.sum()
+            probs = counts.astype(np.float64) / max(1, counts.sum())
         else:
             probs = None
 
-        for sym in range(ALPHABET):
+        for sym in range(BYTE_ALPHABET):
             node_id = len(nodes)
             node = _Node(phrase=(sym,), count=int(counts[sym]))
             nodes.append(node)
             root_children.append(node_id)
-            if mode != "boundary" and sym != EOS and node.count > 0:
+            if mode != "boundary" and node.count > 0:
                 priority = cls._priority(node, mode, probs)
                 heapq.heappush(heap, (-priority, serial, node_id))
                 serial += 1
         nodes[root].children = root_children
 
-        leaf_count = ALPHABET
-        expansions = (target - ALPHABET) // (ALPHABET - 1)
+        leaf_count = BYTE_ALPHABET
+        expansions = (phrase_target - BYTE_ALPHABET) // (BYTE_ALPHABET - 1)
 
         for _ in range(expansions):
             if mode == "boundary":
                 # Literal objective for this experiment: look at the tokens the
                 # current tree actually emits, then split the most frequent one.
-                # Retokenizing after each split is intentionally dumb but exact.
+                # A trailing incomplete phrase is ignored while fitting the tree.
                 emitted = cls._leaf_counts(nodes, root, data)
                 candidates = [
                     (count, leaf_id)
                     for leaf_id, count in emitted.items()
-                    if count > 0
-                    and nodes[leaf_id].is_leaf
-                    and not nodes[leaf_id].contains_eos
+                    if count > 0 and nodes[leaf_id].is_leaf
                 ]
                 if not candidates:
                     raise RuntimeError("No expandable Tunstall leaves remain")
@@ -128,26 +134,24 @@ class EmpiricalTunstallTokenizer:
                 _, _, node_id = heapq.heappop(heap)
 
             node = nodes[node_id]
-            if not node.is_leaf or node.contains_eos:
-                raise AssertionError("selected a non-expandable node")
+            if not node.is_leaf:
+                raise AssertionError("selected a non-leaf Tunstall node")
 
             child_ids: list[int] = []
             if mode == "empirical":
                 positions = node.positions
                 if positions is None:
-                    # Only root children should normally reach this path.
                     first = node.phrase[0]
-                    positions = np.flatnonzero(symbols[:-1] == first).astype(np.int32)
-                    # If this is unexpectedly deeper, refine by the remainder.
+                    positions = np.flatnonzero(symbols == first).astype(np.int32)
                     if len(node.phrase) > 1:
                         mask = np.ones(len(positions), dtype=bool)
                         for depth, sym in enumerate(node.phrase[1:], start=1):
                             idx = positions.astype(np.int64) + depth
-                            mask &= idx < len(symbols)
-                            valid_idx = idx[mask]
-                            tmp = np.zeros_like(mask)
-                            tmp[np.flatnonzero(mask)] = symbols[valid_idx] == sym
-                            mask = tmp
+                            in_range = idx < len(symbols)
+                            matches = np.zeros(len(positions), dtype=bool)
+                            valid_rows = np.flatnonzero(in_range)
+                            matches[valid_rows] = symbols[idx[in_range]] == sym
+                            mask &= matches
                         positions = positions[mask]
 
                 next_idx = positions.astype(np.int64) + len(node.phrase)
@@ -173,13 +177,12 @@ class EmpiricalTunstallTokenizer:
             else:
                 groups = None
 
-            for sym in range(ALPHABET):
+            for sym in range(BYTE_ALPHABET):
                 phrase = node.phrase + (sym,)
                 if mode == "empirical":
                     pos = groups.get(sym)
                     count = 0 if pos is None else len(pos)
                 else:
-                    # Keep count only for diagnostics. The heap uses IID mass.
                     count = 0
                     pos = None
 
@@ -188,7 +191,7 @@ class EmpiricalTunstallTokenizer:
                 nodes.append(child)
                 child_ids.append(child_id)
 
-                if mode != "boundary" and sym != EOS:
+                if mode != "boundary":
                     priority = cls._priority(child, mode, probs)
                     if priority > 0:
                         heapq.heappush(heap, (-priority, serial, child_id))
@@ -196,35 +199,34 @@ class EmpiricalTunstallTokenizer:
 
             node.children = child_ids
             node.positions = None
-            leaf_count += ALPHABET - 1
+            leaf_count += BYTE_ALPHABET - 1
 
-        if leaf_count != target:
-            raise AssertionError((leaf_count, target))
+        if leaf_count != phrase_target:
+            raise AssertionError((leaf_count, phrase_target))
 
         token_id = 0
         for node in nodes:
             if node.is_leaf:
                 node.token_id = token_id
                 token_id += 1
-        if token_id != target:
-            raise AssertionError((token_id, target))
+        if token_id != phrase_target:
+            raise AssertionError((token_id, phrase_target))
 
-        return cls(nodes, root, target, mode)
+        return cls(nodes, root, phrase_target, mode)
 
     @staticmethod
     def _leaf_counts(nodes: list[_Node], root: int, data: bytes) -> dict[int, int]:
         counts: dict[int, int] = {}
         node_id = root
-        for sym in chain(data, (EOS,)):
+        for sym in data:
             children = nodes[node_id].children
             if children is None:
-                raise AssertionError("expected internal node before consuming symbol")
+                raise AssertionError("expected internal node before consuming byte")
             node_id = children[sym]
             if nodes[node_id].is_leaf:
                 counts[node_id] = counts.get(node_id, 0) + 1
                 node_id = root
-        if node_id != root:
-            raise AssertionError("EOS failed to terminate tokenizer-fit stream")
+        # A trailing partial phrase is intentionally ignored while fitting.
         return counts
 
     @staticmethod
@@ -237,44 +239,91 @@ class EmpiricalTunstallTokenizer:
             p *= float(probs[sym])
         return p
 
-    def encode(self, text: str) -> list[int]:
-        data = text.encode("utf-8")
-        return self.encode_bytes(data)
+    def encode(self, text: str, *, add_eos: bool = False) -> list[int]:
+        return self.encode_bytes(text.encode("utf-8"), add_eos=add_eos)
 
-    def encode_bytes(self, data: bytes) -> list[int]:
-        # EOS makes the phrase dictionary complete for finite messages.
-        symbols: Iterable[int] = chain(data, (EOS,))
+    def encode_bytes(self, data: bytes, *, add_eos: bool = False) -> list[int]:
         out: list[int] = []
         node_id = self.root
-        for sym in symbols:
-            node = self.nodes[node_id]
-            if node.children is None:
-                raise AssertionError("expected internal node before consuming a symbol")
-            node_id = node.children[sym]
+        for sym in data:
+            children = self.nodes[node_id].children
+            if children is None:
+                raise AssertionError("expected internal node before consuming byte")
+            node_id = children[sym]
             node = self.nodes[node_id]
             if node.is_leaf:
                 assert node.token_id is not None
                 out.append(node.token_id)
                 node_id = self.root
         if node_id != self.root:
-            raise AssertionError("EOS failed to terminate final phrase")
+            raise ValueError(
+                "byte string ends inside a Tunstall phrase; align the boundary first"
+            )
+        if add_eos:
+            out.append(self.eos_id)
         return out
 
     def decode_bytes(self, ids: Iterable[int]) -> bytes:
-        symbols: list[int] = []
+        out = bytearray()
+        saw_eos = False
         for token_id in ids:
-            symbols.extend(self._id_to_phrase[token_id])
-        if not symbols or symbols[-1] != EOS:
-            raise ValueError("encoded message does not terminate in EOS")
-        if EOS in symbols[:-1]:
-            raise ValueError("EOS appeared before end of message")
-        return bytes(symbols[:-1])
+            if token_id == self.eos_id:
+                if saw_eos:
+                    raise ValueError("multiple EOS tokens")
+                saw_eos = True
+                continue
+            if saw_eos:
+                raise ValueError("token after EOS")
+            out.extend(self._id_to_phrase[token_id])
+        return bytes(out)
+
+    def align_utf8_boundaries(self, data: bytes, fractions: list[float]) -> list[int]:
+        """Move requested cuts backward to completed phrase + UTF-8 boundaries."""
+        targets = [len(data) if f >= 1.0 else round(len(data) * f) for f in fractions]
+        out: list[int] = []
+        target_i = 0
+        last_good = 0
+        node_id = self.root
+
+        for pos, sym in enumerate(data, start=1):
+            while target_i < len(targets) and targets[target_i] < pos:
+                if last_good <= (out[-1] if out else 0):
+                    raise ValueError("aligned prequential boundary collapsed")
+                out.append(last_good)
+                target_i += 1
+
+            children = self.nodes[node_id].children
+            if children is None:
+                raise AssertionError("expected internal node before consuming byte")
+            node_id = children[sym]
+            if self.nodes[node_id].is_leaf:
+                node_id = self.root
+                # UTF-8 boundaries are positions not immediately followed by a
+                # continuation byte. This keeps the BPE/string path valid too.
+                if pos == len(data) or data[pos] & 0xC0 != 0x80:
+                    last_good = pos
+
+            while target_i < len(targets) and targets[target_i] == pos:
+                if last_good <= (out[-1] if out else 0):
+                    raise ValueError("aligned prequential boundary collapsed")
+                out.append(last_good)
+                target_i += 1
+
+        while target_i < len(targets):
+            if last_good <= (out[-1] if out else 0):
+                raise ValueError("aligned prequential boundary collapsed")
+            out.append(last_good)
+            target_i += 1
+
+        return out
 
     def token_piece(self, token_id: int) -> tuple[int, ...]:
+        if token_id == self.eos_id:
+            return ()
         return self._id_to_phrase[token_id]
 
     def max_phrase_bytes(self) -> int:
-        return max(sum(sym != EOS for sym in p) for p in self._id_to_phrase)
+        return max(len(p) for p in self._id_to_phrase)
 
     def assert_prefix_free(self) -> None:
         phrases = sorted(self._id_to_phrase)
@@ -284,7 +333,7 @@ class EmpiricalTunstallTokenizer:
 
 
 class BPETokenizer:
-    """Thin byte-level BPE wrapper with the same vocabulary size."""
+    """Thin byte-level BPE wrapper with the same model vocabulary size."""
 
     EOS_TOKEN = "<|eos|>"
 
@@ -331,7 +380,8 @@ class BPETokenizer:
             )
         return wrapped
 
-    def encode(self, text: str) -> list[int]:
+    def encode(self, text: str, *, add_eos: bool = False) -> list[int]:
         ids = self.tokenizer.encode(text, add_special_tokens=False).ids
-        ids.append(self.eos_id)
+        if add_eos:
+            ids.append(self.eos_id)
         return ids
