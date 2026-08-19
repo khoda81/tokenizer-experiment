@@ -26,6 +26,7 @@ docs/experiments/
   001-bpe-vs-tunstall-wikitext2.md       legacy block-prequential
   002-sparse-prefix-bunstall.md           tokenizer-only structural experiment
   003-legacy-block-prequential-bunstall.md
+  004-online-prequential-tokenizer-comparison.md
 
 artifacts/               local generated outputs; gitignored
 
@@ -51,13 +52,13 @@ There is no held-out scoring pass, no geometric blocking, no retraining from scr
 
 The default datums are as fine-grained as possible while remaining identical for every tokenizer: start from individual WikiText dataset rows and greedily merge adjacent rows only when necessary for a prefix-free Tunstall phrase to terminate at the datum boundary.
 
-Each datum is modeled as:
+Each datum is scored as:
 
 ```text
-<EOS-as-BOS> content tokens <EOS>
+<EOS-as-BOS> content tokens
 ```
 
-so the first content token is predicted by the model rather than charged an artificial uniform code. If an unusually long datum exceeds the 256-token model context, its loss is accumulated over context-sized chunks and the optimizer still steps only once after the complete datum has been scored.
+The reserved EOS embedding is reused only as fixed start-of-datum context so the first content token is predicted by the model. Datum boundaries are already known side information and are **not** charged as synthetic EOS targets; the raw row separator itself is present as its literal newline byte. If an unusually long datum exceeds the 256-token model context, its loss is accumulated over context-sized chunks and the optimizer still steps only once after the complete datum has been scored.
 
 ## Run
 
@@ -120,11 +121,12 @@ Inspection output includes:
 - WikiText-2 raw.
 - Roughly the first 2 MB of **complete dataset rows** fit the tokenizers and are treated as shared side information.
 - All remaining complete rows form the candidate online stream.
-- Requested vocabulary ~4096; the byte-only Tunstall tree plus separate EOS snaps this to 4082.
+- Requested vocabulary ~4096; the byte-only Tunstall tree plus separate reserved start token snaps this to 4082.
 - Same 4-layer, 256-wide Transformer for every tokenizer.
 - Context 256 tokens.
 - One model initialization, one ordered pass, one optimizer update per raw datum.
 - Learning rate `1e-3` by default.
+- New/experimental tokenizer variants run before established baselines so obviously bad experiments can be stopped early.
 - BPE, Tunstall-boundary, Bunstall-entropy, and Bunstall-frequency are compared on exactly the same raw datums.
 
 ## Outputs and W&B Artifacts
