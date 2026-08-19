@@ -52,10 +52,7 @@ def display_bytes(piece: bytes, *, limit: int = 48) -> str:
     rendered = "".join(_VISIBLE_WHITESPACE.get(ch, ch) for ch in text)
     # Keep other control/non-printing characters escaped, but leave our visible
     # whitespace glyphs and ordinary Unicode readable.
-    rendered = "".join(
-        ch if ch.isprintable() else repr(ch)[1:-1]
-        for ch in rendered
-    )
+    rendered = "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in rendered)
     return rendered + suffix
 
 
@@ -71,6 +68,19 @@ def categorical_entropy(counts: np.ndarray) -> float:
         return 0.0
     probs = counts[counts > 0].astype(np.float64) / total
     return float(-(probs * np.log2(probs)).sum())
+
+
+def count_overlapping(data: bytes, pattern: bytes) -> int:
+    if not pattern:
+        raise ValueError("pattern must be nonempty")
+    count = 0
+    start = 0
+    while True:
+        pos = data.find(pattern, start)
+        if pos < 0:
+            return count
+        count += 1
+        start = pos + 1
 
 
 def emitted_token_rows(
@@ -130,9 +140,7 @@ def tunstall_split_rows(
 
         children = tokenizer.nodes[node_id].children
         if children is None:
-            raise AssertionError(
-                "expected internal node while inspecting Tunstall tree"
-            )
+            raise AssertionError("expected internal node while inspecting Tunstall tree")
         node_id = children[symbol]
         if tokenizer.nodes[node_id].is_leaf:
             emitted_tokens += 1
@@ -166,9 +174,7 @@ def tunstall_split_rows(
                 "prefix_hex": bytes(node.phrase).hex(),
                 "prefix_bytes": len(node.phrase),
                 "visits": visits,
-                "mass_per_emitted_token": visits / emitted_tokens
-                if emitted_tokens
-                else 0.0,
+                "mass_per_emitted_token": visits / emitted_tokens if emitted_tokens else 0.0,
                 "observed_children": observed,
                 "unused_children": 256 - observed,
                 "next_byte_entropy_bits": entropy,
@@ -211,10 +217,10 @@ def bpe_merge_split_rows(
         left = bytelevel_piece_bytes(left_text)
         right = bytelevel_piece_bytes(right_text)
         merged = left + right
-        left_count = raw.count(left)
+        left_count = count_overlapping(raw, left)
         if left_count < min_left_occurrences:
             continue
-        merged_count = raw.count(merged)
+        merged_count = count_overlapping(raw, merged)
         q = min(1.0, merged_count / left_count)
         rows.append(
             {
@@ -237,18 +243,14 @@ def bpe_merge_split_rows(
 def summarize_bpe_splits(rows: list[dict[str, Any]]) -> dict[str, float]:
     if not rows:
         return {}
-    entropies = np.asarray(
-        [row["binary_entropy_bits"] for row in rows], dtype=np.float64
-    )
+    entropies = np.asarray([row["binary_entropy_bits"] for row in rows], dtype=np.float64)
     qs = np.asarray([row["q_followed_by_right"] for row in rows], dtype=np.float64)
     support = np.asarray([row["left_occurrences"] for row in rows], dtype=np.float64)
     return {
         "count": float(len(rows)),
         "mean_binary_entropy_bits": float(entropies.mean()),
         "median_binary_entropy_bits": float(np.median(entropies)),
-        "support_weighted_binary_entropy_bits": float(
-            np.average(entropies, weights=support)
-        ),
+        "support_weighted_binary_entropy_bits": float(np.average(entropies, weights=support)),
         "median_q": float(np.median(qs)),
         "fraction_q_between_0.25_and_0.75": float(np.mean((qs >= 0.25) & (qs <= 0.75))),
     }
