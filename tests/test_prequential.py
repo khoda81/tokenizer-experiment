@@ -5,61 +5,56 @@ import torch
 from torch import nn
 
 from tokenizer_experiment.model import CausalTransformer, ModelConfig
-from tokenizer_experiment.prequential import TokenWindows, score_model
+from tokenizer_experiment.prequential import _online_datum_step
 
 
-def test_token_windows_score_each_token_after_first_exactly_once():
-    ids = list(range(23))
-    ds = TokenWindows(ids, context=5)
-
-    targets = []
-    for _x, y in ds:
-        targets.extend(y.tolist())
-
-    assert targets == ids[1:]
-
-
-class UniformModel(nn.Module):
+class BiasOnlyModel(nn.Module):
     def __init__(self, vocab_size: int):
         super().__init__()
         self.vocab_size = vocab_size
-        self.anchor = nn.Parameter(torch.empty(0))
+        self.bias = nn.Parameter(torch.zeros(vocab_size))
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         batch, time = ids.shape
-        return torch.zeros(batch, time, self.vocab_size, device=ids.device)
+        return self.bias.view(1, 1, -1).expand(batch, time, -1)
 
 
-def test_scoring_uniform_model_is_exact_uniform_code():
+def test_online_datum_scores_before_single_update_across_context_chunks():
     vocab_size = 17
-    ids = [i % vocab_size for i in range(37)]
-    model = UniformModel(vocab_size)
+    model = BiasOnlyModel(vocab_size)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    ids = [1, 2, 3, 4, 5, 6, 7]
 
-    bits, _ = score_model(
+    bits = _online_datum_step(
         model,
+        optimizer,
         ids,
-        context=7,
+        eos_id=16,
+        context=3,
         device=torch.device("cpu"),
-        batch_size=3,
     )
 
-    assert bits == pytest.approx(len(ids) * math.log2(vocab_size), rel=1e-6)
+    # Content tokens plus one EOS termination target are all scored while the
+    # model is still uniform, even though the datum spans several context chunks.
+    assert bits == pytest.approx((len(ids) + 1) * math.log2(vocab_size), rel=1e-6)
+    assert not torch.allclose(model.bias, torch.zeros_like(model.bias))
 
 
-def test_single_token_block_uses_uniform_code():
-    vocab_size = 17
-    model = UniformModel(vocab_size)
+def test_empty_content_datum_still_predicts_eos_once():
+    vocab_size = 7
+    model = BiasOnlyModel(vocab_size)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
 
-    bits, seconds = score_model(
+    bits = _online_datum_step(
         model,
-        [3],
-        context=7,
+        optimizer,
+        [],
+        eos_id=6,
+        context=4,
         device=torch.device("cpu"),
-        batch_size=3,
     )
 
-    assert bits == pytest.approx(math.log2(vocab_size))
-    assert seconds == 0.0
+    assert bits == pytest.approx(math.log2(vocab_size), rel=1e-6)
 
 
 def test_transformer_uses_small_tied_embedding_initialization():
