@@ -1,5 +1,7 @@
 # Experiment 001 — BPE vs prefix-free Tunstall on WikiText-2
 
+> **LEGACY / protocol correction (2026-08-19):** this experiment used a geometric **block-prequential** evaluator: fresh models were repeatedly trained on preceding prefixes and then scored on separate future blocks. That is not the online datum-by-datum prequential protocol intended for this project. The numerical model comparison below is retained as historical evidence only and will be repeated. Tokenizer-only diagnostics remain valid.
+
 Date: 2026-08-19  
 Baseline commit: `8f0db6c`  
 Dataset: `Salesforce/wikitext`, `wikitext-2-raw-v1`
@@ -20,11 +22,11 @@ The comparison metric is **bits per raw UTF-8 byte**, not token perplexity.
   - Tunstall: 4081 prefix-free byte-phrase leaves + one separate EOS token.
   - BPE: 4082 vocabulary entries including its separate EOS token.
 - Tunstall mode: `boundary`.
-- Prequential cuts: 1%, 2%, 4%, 8%, 16%, 32%, 64%, 100%, moved slightly backward when necessary so every cut is both a UTF-8 boundary and a completed Tunstall phrase.
+- Block-prequential cuts: 1%, 2%, 4%, 8%, 16%, 32%, 64%, 100%, moved slightly backward when necessary so every cut is both a UTF-8 boundary and a completed Tunstall phrase.
 - Transformer: 4 layers, width 256, 4 heads, context 256 tokens.
 - AdamW, learning rate `3e-4`, weight decay `0.1`, batch size 16.
-- Every prequential prefix is trained **from scratch for exactly one pass**. There is no epoch hyperparameter.
-- The first block is encoded with a uniform token code.
+- Every block-prequential prefix was trained **from scratch for exactly one pass**.
+- The first block was encoded with a uniform token code.
 
 Aligned byte cuts were:
 
@@ -42,9 +44,9 @@ Aligned byte cuts were:
 
 The Tunstall tree had 4081 phrase leaves but only 15 internal-node expansions, because a full byte-tree expansion replaces one leaf with 256 children and therefore costs 255 additional leaves. Its longest phrase was only 3 bytes.
 
-This means the current Tunstall construction does **not** achieve the motivating goal of a nearly uniform marginal token distribution at this vocabulary size. That is an experimental result, not a hidden correction.
+This means the current Tunstall construction does **not** achieve the motivating goal of a nearly uniform marginal token distribution at this vocabulary size. That tokenizer result remains valid.
 
-## Prequential results
+## Legacy block-prequential results
 
 ### BPE
 
@@ -72,7 +74,7 @@ This means the current Tunstall construction does **not** achieve the motivating
 | 6 | 2.86 MB | 2.86 MB | 372 | 3.4005 | 3.8139 |
 | 7 | 5.73 MB | 3.22 MB | 744 | 2.9151 | **3.4903** |
 
-Final result:
+Historical result:
 
 ```text
 BPE                  2.831569 bits/byte
@@ -80,29 +82,14 @@ Tunstall-boundary    3.490299 bits/byte
 Tunstall - BPE      +0.658730 bits/byte
 ```
 
-BPE therefore wins this first experiment by about **0.659 bits per raw byte**.
+These values describe the legacy block-prequential setup only. They must not be cited as the project's online prequential result.
 
-## Interpretation
+## What remains useful
 
-The strongest immediate result is not simply "Tunstall loses". The two tokenizers induce very different computational problems:
+The structural tokenizer findings remain useful:
 
 - BPE produces about half as many tokens per raw byte, so a 256-token context covers roughly twice as many bytes.
-- Tunstall consequently performs roughly twice as many optimizer updates in a one-pass training regime.
-- BPE is also much closer to marginally uniform than this 256-way Tunstall construction, contrary to the original motivation.
-- Despite its much worse uniform starting code, Tunstall steadily narrows the block-loss gap as more data becomes available: the final held-out block is 2.9151 vs 2.6559 bits/byte rather than the initial 6.3689 vs 3.2476.
+- BPE is much closer to marginally uniform than the 256-way Tunstall construction.
+- Full byte-level Tunstall expansion is extremely expensive at ~4k vocabulary because each expansion consumes 255 additional slots.
 
-For that reason future runs should preserve all three axes rather than normalizing them away:
-
-1. prequential bits / raw byte,
-2. optimizer steps / raw byte,
-3. effective raw-byte context represented by a fixed token context.
-
-## Next experiments
-
-- Repeat across several seeds.
-- Sweep vocabulary size; the 256-way tree is extremely coarse at ~4k leaves.
-- Compare `boundary`, `empirical`, and classical IID Tunstall construction.
-- Inspect whether a different complete prefix-tree construction can improve marginal vocabulary utilization without giving up prefix-freeness.
-- Compare code curves both against raw bytes observed and cumulative optimizer steps.
-
-The JSON result remains the machine-readable source of truth for a run; W&B logging added after this baseline mirrors the same stage trace for interactive comparison.
+The model comparison itself is being repeated using one persistent model and the corrected online loop: score one raw datum, update once from that same loss, and never revisit it.
