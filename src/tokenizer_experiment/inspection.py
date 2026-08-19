@@ -28,6 +28,12 @@ def _bytelevel_decoder() -> dict[str, int]:
 
 
 _BYTELEVEL_DECODER = _bytelevel_decoder()
+_VISIBLE_WHITESPACE = {
+    " ": "␠",
+    "\n": "⏎",
+    "\t": "⇥",
+    "\r": "␍",
+}
 
 
 def bytelevel_piece_bytes(piece: str) -> bytes:
@@ -36,13 +42,21 @@ def bytelevel_piece_bytes(piece: str) -> bytes:
 
 
 def display_bytes(piece: bytes, *, limit: int = 48) -> str:
+    """Render bytes compactly while making invisible whitespace explicit."""
     if len(piece) > limit:
         piece = piece[:limit]
         suffix = "…"
     else:
         suffix = ""
     text = piece.decode("utf-8", errors="backslashreplace")
-    return repr(text)[1:-1] + suffix
+    rendered = "".join(_VISIBLE_WHITESPACE.get(ch, ch) for ch in text)
+    # Keep other control/non-printing characters escaped, but leave our visible
+    # whitespace glyphs and ordinary Unicode readable.
+    rendered = "".join(
+        ch if ch.isprintable() else repr(ch)[1:-1]
+        for ch in rendered
+    )
+    return rendered + suffix
 
 
 def binary_entropy(p: float) -> float:
