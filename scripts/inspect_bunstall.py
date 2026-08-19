@@ -15,6 +15,8 @@ from tokenizer_experiment.inspection import display_bytes
 from tokenizer_experiment.sparse_prefix import SparsePrefixTokenizer
 from tokenizer_experiment.tunstall import EmpiricalTunstallTokenizer
 
+ARTIFACTS_DIR = Path("artifacts")
+
 
 def token_rows(tokenizer: SparsePrefixTokenizer, raw: bytes, top_n: int) -> list[dict]:
     ids = tokenizer.encode_bytes(raw)
@@ -101,7 +103,9 @@ def main() -> None:
     parser.add_argument("--tokenizer-fit-mb", type=float, default=2.0)
     parser.add_argument("--mode", choices=["entropy", "frequency"], default="entropy")
     parser.add_argument("--top", type=int, default=30)
-    parser.add_argument("--output", default="bunstall-inspection.json")
+    parser.add_argument(
+        "--output", default=str(ARTIFACTS_DIR / "bunstall-inspection.json")
+    )
     args = parser.parse_args()
 
     print(f"Loading Salesforce/wikitext / {args.dataset_config} ...")
@@ -109,8 +113,6 @@ def main() -> None:
     raw = "\n".join(ds["text"]).encode("utf-8")
     fit_raw, _ = split_tokenizer_fit(raw, int(args.tokenizer_fit_mb * 1_000_000))
 
-    # Keep the exact model vocabulary used by the existing BPE/Tunstall baseline
-    # so tokenizer diagnostics are directly comparable.
     actual_vocab = EmpiricalTunstallTokenizer.legal_vocab_size(args.vocab_size)
     print(
         f"fit corpus: {mb(len(fit_raw)):.2f} MB; "
@@ -130,18 +132,11 @@ def main() -> None:
     )
 
     stats = tokenizer_stats(tokenizer, fit_raw.decode("utf-8"))
-    stats["unigram_bits_per_byte"] = (
-        stats["unigram_entropy_bits_per_token"] / stats["bytes_per_token"]
-    )
     print("\nTokenizer diagnostics on fit corpus")
     print(f"  bytes/token:       {stats['bytes_per_token']:.3f}")
-    print(
-        f"  H(T)/log2(V):      {stats['entropy_fraction_of_uniform']:.4f}"
-    )
+    print(f"  H(T)/log2(V):      {stats['entropy_fraction_of_uniform']:.4f}")
     print(f"  unigram bits/byte: {stats['unigram_bits_per_byte']:.4f}")
-    print(
-        f"  vocab used:        {stats['distinct_tokens_used']}/{actual_vocab}"
-    )
+    print(f"  vocab used:        {stats['distinct_tokens_used']}/{actual_vocab}")
 
     tokens = token_rows(tokenizer, fit_raw, args.top)
     expansions = expansion_rows(tokenizer)
@@ -188,10 +183,12 @@ def main() -> None:
             ),
         },
     }
-    Path(args.output).write_text(
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    print(f"\nWrote {args.output}")
+    print(f"\nWrote {output_path}")
 
 
 if __name__ == "__main__":
