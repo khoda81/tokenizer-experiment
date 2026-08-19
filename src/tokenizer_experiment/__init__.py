@@ -1,6 +1,6 @@
 from .experiment import ExperimentConfig, run_experiment
 from .model import CausalTransformer, ModelConfig
-from .prequential import TrainConfig, run_block_prequential
+from .prequential import TrainConfig, run_online_prequential
 from .tunstall import BPETokenizer, EmpiricalTunstallTokenizer
 
 __all__ = [
@@ -10,6 +10,6 @@ __all__ = [
     "ExperimentConfig",
     "ModelConfig",
     "TrainConfig",
-    "run_block_prequential",
     "run_experiment",
+    "run_online_prequential",
 ]
