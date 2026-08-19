@@ -10,7 +10,8 @@ import numpy as np
 import wandb
 from datasets import load_dataset
 
-from tokenizer_experiment.experiment import mb, split_tokenizer_fit, tokenizer_stats
+from tokenizer_experiment.data import mb, split_tokenizer_fit
+from tokenizer_experiment.experiment import tokenizer_stats
 from tokenizer_experiment.inspection import display_bytes
 from tokenizer_experiment.sparse_prefix import SparsePrefixTokenizer
 from tokenizer_experiment.tunstall import EmpiricalTunstallTokenizer
@@ -139,7 +140,7 @@ def main() -> None:
         f"max phrase={tokenizer.max_phrase_bytes()} bytes"
     )
 
-    stats = tokenizer_stats(tokenizer, fit_raw.decode("utf-8"))
+    stats = tokenizer_stats(tokenizer, [fit_raw])
     print("\nTokenizer diagnostics on fit corpus")
     print(f"  bytes/token:       {stats['bytes_per_token']:.3f}")
     print(f"  H(T)/log2(V):      {stats['entropy_fraction_of_uniform']:.4f}")
@@ -214,7 +215,13 @@ def main() -> None:
         },
         tags=["tokenizer-inspection", "bunstall", args.mode],
     ) as run:
-        run.log({f"tokenizer/{key}": value for key, value in stats.items() if isinstance(value, (int, float))})
+        run.log(
+            {
+                f"tokenizer/{key}": value
+                for key, value in stats.items()
+                if isinstance(value, (int, float))
+            }
+        )
         artifact = wandb.Artifact(
             name=f"bunstall-{args.mode}-inspection",
             type="tokenizer-inspection",
