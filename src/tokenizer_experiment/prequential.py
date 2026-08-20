@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import math
 import random
 import time
@@ -15,6 +16,7 @@ from tqdm.auto import tqdm
 from .model import CausalTransformer, ModelConfig
 
 ProgressCallback = Callable[[str, dict[str, Any]], None]
+DEFAULT_TAIL_WINDOWS_BYTES = (250_000, 500_000, 1_000_000, 2_000_000, 4_000_000)
 
 
 @dataclass(frozen=True)
@@ -123,11 +125,45 @@ def _stream_update_step(
                 reduction="sum",
             )
 
-        total_nats += float(loss_sum.detach())
+        total_nats += loss_sum.detach().item()
         (loss_sum / update_tokens).backward()
 
     optimizer.step()
     return total_nats / math.log(2.0)
+
+
+def _tail_rates(
+    cumulative_bytes: list[int],
+    cumulative_bits: list[float],
+    windows: tuple[int, ...] = DEFAULT_TAIL_WINDOWS_BYTES,
+) -> dict[str, dict[str, float | int]]:
+    """Return exact code rates from the closest real update boundary to each tail size."""
+    if len(cumulative_bytes) != len(cumulative_bits):
+        raise ValueError("tail cumulative arrays differ in length")
+    final_bytes = cumulative_bytes[-1]
+    final_bits = cumulative_bits[-1]
+    out: dict[str, dict[str, float | int]] = {}
+    for requested in windows:
+        if requested <= 0 or requested >= final_bytes:
+            continue
+        target = final_bytes - requested
+        i = bisect.bisect_left(cumulative_bytes, target)
+        # Both neighbouring entries are real optimizer boundaries. Pick the one
+        # whose resulting tail length is closest to the requested raw-byte span.
+        candidates = [i]
+        if i > 0:
+            candidates.append(i - 1)
+        start_i = min(candidates, key=lambda j: abs(cumulative_bytes[j] - target))
+        start_bytes = cumulative_bytes[start_i]
+        span = final_bytes - start_bytes
+        bits = final_bits - cumulative_bits[start_i]
+        out[str(requested)] = {
+            "requested_bytes": requested,
+            "actual_bytes": span,
+            "bits": bits,
+            "bits_per_byte": bits / span,
+        }
+    return out
 
 
 def run_stream_prequential(
@@ -170,6 +206,10 @@ def run_stream_prequential(
     total_bits = 0.0
     total_tokens = 0
     trace: list[dict[str, Any]] = []
+    # Keep one tiny cumulative record per optimizer boundary so tail rates are
+    # computed from the actual code, independent of telemetry/log_every.
+    cumulative_raw = [0]
+    cumulative_code = [0.0]
     start_time = time.perf_counter()
     prev_raw = 0
     prev_token = 0
@@ -198,6 +238,8 @@ def run_stream_prequential(
         update_tokens = token_end - prev_token
         total_bits += bits
         total_tokens += update_tokens
+        cumulative_raw.append(raw_end)
+        cumulative_code.append(total_bits)
         point = OnlinePoint(
             update=update_i,
             update_bytes=update_bytes,
@@ -236,5 +278,6 @@ def run_stream_prequential(
         "optimizer_steps": len(raw_boundaries),
         "tokens": total_tokens,
         "elapsed_seconds": elapsed,
+        "tail": _tail_rates(cumulative_raw, cumulative_code),
         "code_curve": trace,
     }
