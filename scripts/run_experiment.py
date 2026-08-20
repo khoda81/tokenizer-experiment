@@ -44,6 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=parse_bunstall_modes("frequency,entropy"),
         help="Comma-separated Bunstall modes to include; empty string disables Bunstall.",
     )
+    p.add_argument(
+        "--unigram-max-piece-length",
+        type=int,
+        default=16,
+        help="Maximum Byte-Unigram piece length in ByteLevel symbols/bytes.",
+    )
     p.add_argument("--tokenizer-fit-mb", type=float, default=2.0)
     p.add_argument("--max-preq-mb", type=float, default=0.0)
     p.add_argument(
@@ -109,6 +115,7 @@ def main() -> None:
         "vocab_size": args.vocab_size,
         "tunstall_mode": args.tunstall_mode,
         "bunstall_modes": args.bunstall_modes,
+        "unigram_max_piece_length": args.unigram_max_piece_length,
         "tokenizer_fit_mb": args.tokenizer_fit_mb,
         "max_preq_mb": args.max_preq_mb,
         "update_bytes": args.update_bytes,
@@ -158,11 +165,16 @@ def main() -> None:
         entity=args.wandb_entity,
         name=args.wandb_run_name,
         mode=args.wandb_mode,
-        # W&B itself creates a `wandb/` child under this directory.
         dir=str(ARTIFACTS_DIR),
         config={**asdict(config), "artifact_every": args.artifact_every},
         save_code=True,
-        tags=["continuous-prequential", "tokenization", config.tunstall_mode, "bunstall"],
+        tags=[
+            "continuous-prequential",
+            "tokenization",
+            "byte-unigram",
+            config.tunstall_mode,
+            "bunstall",
+        ],
     ) as run:
 
         def log_progress_artifact(model_name: str, update: int, status: str) -> None:
