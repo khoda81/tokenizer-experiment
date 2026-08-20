@@ -4,6 +4,31 @@ import math
 from collections.abc import Iterable
 
 
+def _bytelevel_decoder() -> dict[str, int]:
+    visible = (
+        list(range(ord("!"), ord("~") + 1))
+        + list(range(ord("¡"), ord("¬") + 1))
+        + list(range(ord("®"), ord("ÿ") + 1))
+    )
+    byte_values = visible[:]
+    codepoints = visible[:]
+    extra = 0
+    for value in range(256):
+        if value not in visible:
+            byte_values.append(value)
+            codepoints.append(256 + extra)
+            extra += 1
+    return {chr(codepoint): value for value, codepoint in zip(byte_values, codepoints)}
+
+
+_BYTELEVEL_DECODER = _bytelevel_decoder()
+
+
+def _bytelevel_piece_bytes(piece: str) -> bytes:
+    """Invert the reversible byte-to-Unicode alphabet used by ByteLevel."""
+    return bytes(_BYTELEVEL_DECODER[ch] for ch in piece)
+
+
 class ByteUnigramTokenizer:
     """Byte-complete Unigram LM tokenizer using Hugging Face Tokenizers.
 
@@ -107,22 +132,3 @@ class ByteUnigramTokenizer:
             for token_id in range(self.vocab_size)
             if token_id != self.eos_id
         )
-
-
-def _bytelevel_piece_bytes(piece: str) -> bytes:
-    """Invert the reversible byte-to-Unicode alphabet used by ByteLevel."""
-    visible = (
-        list(range(ord("!"), ord("~") + 1))
-        + list(range(ord("¡"), ord("¬") + 1))
-        + list(range(ord("®"), ord("ÿ") + 1))
-    )
-    byte_values = visible[:]
-    codepoints = visible[:]
-    extra = 0
-    for value in range(256):
-        if value not in visible:
-            byte_values.append(value)
-            codepoints.append(256 + extra)
-            extra += 1
-    decoder = {chr(codepoint): value for value, codepoint in zip(byte_values, codepoints)}
-    return bytes(decoder[ch] for ch in piece)
