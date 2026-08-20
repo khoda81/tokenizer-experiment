@@ -32,17 +32,25 @@ def _bytelevel_piece_bytes(piece: str) -> bytes:
 class ByteUnigramTokenizer:
     """Byte-complete Unigram LM tokenizer using Hugging Face Tokenizers.
 
-    The source tokenizer gets ``model_vocab_size - 1`` real byte pieces. The
-    final model class is reserved externally as BOS, so the Unigram trainer does
-    not spend a source-token slot on a special string and raw text can never
-    accidentally emit BOS.
+    The Unigram trainer is asked for at most ``model_vocab_size - 1`` real byte
+    pieces. Hugging Face may return fewer pieces when the training corpus does
+    not contain enough useful candidates. The Transformer model vocabulary is
+    still kept at the requested fixed size: any unfilled source slots are simply
+    unreachable token IDs, and the final model class is reserved externally as
+    BOS. This keeps softmax width identical across tokenizer experiments.
     """
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, model_vocab_size: int):
         self.tokenizer = tokenizer
         self.source_vocab_size = tokenizer.get_vocab_size()
-        self.eos_id = self.source_vocab_size  # historical interface name; BOS only.
-        self.vocab_size = self.source_vocab_size + 1
+        if self.source_vocab_size > model_vocab_size - 1:
+            raise ValueError(
+                f"source vocab {self.source_vocab_size} exceeds available "
+                f"{model_vocab_size - 1} source-token slots"
+            )
+        self.vocab_size = model_vocab_size
+        self.eos_id = model_vocab_size - 1  # historical interface name; BOS only.
+        self.unused_source_slots = model_vocab_size - 1 - self.source_vocab_size
 
     @classmethod
     def train(
@@ -65,7 +73,7 @@ class ByteUnigramTokenizer:
 
         from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
-        source_vocab_size = vocab_size - 1
+        requested_source_vocab_size = vocab_size - 1
         tokenizer = Tokenizer(models.Unigram())
         # No Unicode normalization: this experiment codes the exact UTF-8 bytes.
         # use_regex=False keeps the input as one byte-level stream instead of
@@ -75,7 +83,7 @@ class ByteUnigramTokenizer:
         )
         tokenizer.decoder = decoders.ByteLevel()
         trainer = trainers.UnigramTrainer(
-            vocab_size=source_vocab_size,
+            vocab_size=requested_source_vocab_size,
             show_progress=True,
             special_tokens=[],
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
@@ -92,13 +100,7 @@ class ByteUnigramTokenizer:
         tokenizer.train_from_iterator(
             iterator, trainer=trainer, length=math.ceil(len(text) / char_chunk)
         )
-        wrapped = cls(tokenizer)
-        if wrapped.vocab_size != vocab_size:
-            raise RuntimeError(
-                f"Unigram trainer produced model vocab={wrapped.vocab_size}, "
-                f"expected {vocab_size}. Try a larger tokenizer-fit prefix or a smaller vocabulary."
-            )
-        return wrapped
+        return cls(tokenizer, model_vocab_size=vocab_size)
 
     def encode(self, text: str, *, add_eos: bool = False) -> list[int]:
         ids = self.tokenizer.encode(text, add_special_tokens=False).ids
@@ -109,6 +111,8 @@ class ByteUnigramTokenizer:
     def token_piece(self, token_id: int) -> tuple[int, ...]:
         if token_id == self.eos_id:
             return ()
+        if not 0 <= token_id < self.source_vocab_size:
+            raise ValueError(f"unused Unigram model token id: {token_id}")
         piece = self.tokenizer.id_to_token(token_id)
         if piece is None:
             raise ValueError(f"unknown Unigram token id: {token_id}")
