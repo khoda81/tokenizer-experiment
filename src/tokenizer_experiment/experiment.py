@@ -17,6 +17,7 @@ from .model import ModelConfig
 from .prequential import ProgressCallback, TrainConfig, run_stream_prequential
 from .sparse_prefix import SparsePrefixTokenizer
 from .tunstall import BPETokenizer, EmpiricalTunstallTokenizer
+from .unigram import ByteUnigramTokenizer
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class ExperimentConfig:
     vocab_size: int = 4096
     tunstall_mode: str = "boundary"
     bunstall_modes: tuple[str, ...] = ("frequency", "entropy")
+    unigram_max_piece_length: int = 16
     tokenizer_fit_mb: float = 2.0
     max_preq_mb: float = 0.0
     update_bytes: int = 256
@@ -175,7 +177,7 @@ def run_experiment(
     actual_vocab = EmpiricalTunstallTokenizer.legal_vocab_size(config.vocab_size)
     print(
         f"Requested vocab {config.vocab_size}; using exact shared model vocab {actual_vocab} "
-        f"(4081 phrase slots + one reserved BOS token at this size)"
+        f"(4081 source-token slots + one reserved BOS token at this size)"
     )
     print(f"Loading Salesforce/wikitext / {config.dataset_config} ...")
     ds = load_dataset("Salesforce/wikitext", config.dataset_config, split="train")
@@ -218,6 +220,18 @@ def run_experiment(
         f"dropped trailing partial Tunstall phrase={dropped_tail} bytes"
     )
 
+    print("\nTraining byte-level Unigram LM tokenizer ...")
+    t0 = time.perf_counter()
+    unigram = ByteUnigramTokenizer.train(
+        fit_text,
+        vocab_size=actual_vocab,
+        max_piece_length=config.unigram_max_piece_length,
+    )
+    print(
+        f"Byte-Unigram built in {time.perf_counter() - t0:.1f}s; "
+        f"max phrase={unigram.max_phrase_bytes()} bytes"
+    )
+
     print("\nTraining byte-level BPE tokenizer ...")
     t0 = time.perf_counter()
     bpe = BPETokenizer.train(fit_text, vocab_size=actual_vocab)
@@ -238,6 +252,7 @@ def run_experiment(
 
     # Experimental/new tokenizers intentionally run first. Baselines come last.
     tokenizers: list[tuple[str, Any]] = [
+        ("byte-unigram", unigram),
         *[(f"bunstall-{mode}", bunstalls[mode]) for mode in config.bunstall_modes],
         ("bpe", bpe),
         (f"tunstall-{config.tunstall_mode}", tunstall),
@@ -319,6 +334,12 @@ def run_experiment(
         "reserved_special_token": "used as BOS only at the start of the continuous stream",
         "tunstall_mode": config.tunstall_mode,
         "bunstall_modes": list(config.bunstall_modes),
+        "unigram": {
+            "implementation": "Hugging Face Tokenizers Unigram + ByteLevel",
+            "max_piece_length": config.unigram_max_piece_length,
+            "normalization": "none",
+            "pretokenizer_regex": False,
+        },
         "evaluation_order": [name for name, _ in tokenizers],
         "tokenizer_fit_bytes": len(fit_raw),
         "prequential_bytes": len(preq_raw),
