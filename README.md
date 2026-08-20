@@ -2,18 +2,51 @@
 
 Controlled experiments comparing tokenizers by **continuous-stream online prequential codelength in bits per raw UTF-8 byte**.
 
-The active experiment now focuses on **byte-level Unigram LM vs byte-level BPE** using the same flat-softmax Transformer. Earlier Tunstall/Bunstall experiments are retained as historical work: they answered the original token-uniformity question, but are no longer part of the default run.
+The active work now focuses on **byte-level Unigram LM vs byte-level BPE** using the same flat-softmax Transformer. Earlier Tunstall/Bunstall experiments are retained as historical work: they answered the original token-uniformity question, but are no longer part of the default run.
+
+## Current result
+
+Experiment 005 found that Byte-Unigram substantially improved empirical unigram codelength over BPE while keeping almost identical bytes/token:
+
+```text
+                    bytes/token    empirical unigram bpb
+Byte-Unigram           3.669              2.7484
+BPE                    3.665              2.9061
+```
+
+In the matched full-stream prequential run, Byte-Unigram reached 2.2579 bpb versus BPE at 2.3118 bpb.
+
+Experiment 006 then swept AdamW learning rate over `3e-4, 1e-3, 3e-3` using only BPE and Byte-Unigram. The best absolute learning rate for **both** tokenizers was `1e-3`:
+
+| learning rate | Byte-Unigram | BPE | Unigram - BPE |
+| ---: | ---: | ---: | ---: |
+| 3e-4 | **2.286530** | 2.334183 | -0.047652 |
+| 1e-3 | **2.251977** | 2.318919 | **-0.066943** |
+| 3e-3 | **2.286515** | 2.368855 | -0.082341 |
+
+At the shared optimum `1e-3`, Byte-Unigram reduces cumulative prequential codelength by about **2.89%** and still wins late in the stream:
+
+```text
+last ~1 MB:    -0.0261 bpb  (Unigram - BPE)
+last ~500 KB:  -0.0192 bpb
+last ~250 KB:  -0.0162 bpb
+```
+
+This rules out the simplest explanation that BPE merely needed a higher learning rate. Optimization dynamics still matter strongly: at `3e-4`, BPE eventually catches Byte-Unigram locally; at `3e-3`, both worsen but BPE is substantially less robust.
 
 ## Current question
 
-The completed five-tokenizer run found that Byte-Unigram improved held-out unigram codelength and also beat BPE in cumulative prequential bpb, while their late-stream rates nearly converged. The focused follow-up asks whether that cumulative win is primarily **faster online adaptation** rather than a persistent asymptotic representation advantage.
+The next experiment removes a more direct confound:
 
-We therefore compare BPE and Byte-Unigram across multiple AdamW learning rates and report both:
+> Is Byte-Unigram better because the tokenizer saves the Transformer from spending early gradient updates learning the token marginal distribution, or does its segmentation also make the **conditional residual problem** easier?
 
-- cumulative prequential bits/raw-byte,
-- tail bits/raw-byte over approximately 250 KB, 500 KB, 1 MB, 2 MB, and 4 MB.
+Experiment 007 will initialize each tokenizer's output logits with a unigram prior estimated only from the ~2 MB tokenizer-fit side information. Conceptually:
 
-Tail windows are computed from the full per-update code accounting, not from sparsely logged telemetry; each requested window is moved only to the nearest real optimizer boundary.
+```text
+logits_t(x) = contextual_logits_t(x) + log p_fit(t)
+```
+
+This gives both BPE and Byte-Unigram their zero-order distribution for free and asks the Transformer to learn the contextual correction beyond that prior.
 
 ## Layout
 
@@ -33,8 +66,10 @@ scripts/
   inspect_bunstall.py    historical Bunstall inspection
 
 docs/experiments/
-  001-005                 historical experiments
+  001-004  historical tokenizer/uniformity experiments
+  005-byte-unigram.md
   006-bpe-vs-byte-unigram-lr-sweep.md
+  007-unigram-prior-initialization.md
 
 artifacts/               local generated outputs; gitignored
 
@@ -93,7 +128,7 @@ HF_HUB_OFFLINE=1 uv run python scripts/run_experiment.py \
 
 Tokenizers are trained only once; each learning rate gets a fresh Transformer with the same seed and the exact same token stream/update boundaries.
 
-Defaults preserve the completed experiment where useful:
+Current defaults:
 
 - model vocabulary width 4082 (4081 source-token slots + one BOS class),
 - roughly first 2 MB of complete WikiText rows fit the tokenizers,
