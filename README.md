@@ -1,34 +1,40 @@
 # Tokenizer experiment
 
-Small controlled experiments comparing tokenizers by **continuous-stream online prequential codelength in bits per raw UTF-8 byte**.
+Controlled experiments comparing tokenizers by **continuous-stream online prequential codelength in bits per raw UTF-8 byte**.
 
-The experiments compare byte-level BPE, byte-level Unigram LM, prefix-free Tunstall-style byte phrases, and sparse-prefix ("Bunstall") tokenizers using the same flat-softmax Transformer.
+The active experiment now focuses on **byte-level Unigram LM vs byte-level BPE** using the same flat-softmax Transformer. Earlier Tunstall/Bunstall experiments are retained as historical work: they answered the original token-uniformity question, but are no longer part of the default run.
 
-> Earlier runs used either geometric block-prequential evaluation or persistent weights with the Transformer context reset at every dataset row. Those model results are legacy diagnostics, not the intended compressor-like prequential measurement.
+## Current question
+
+The completed five-tokenizer run found that Byte-Unigram improved held-out unigram codelength and also beat BPE in cumulative prequential bpb, while their late-stream rates nearly converged. The focused follow-up asks whether that cumulative win is primarily **faster online adaptation** rather than a persistent asymptotic representation advantage.
+
+We therefore compare BPE and Byte-Unigram across multiple AdamW learning rates and report both:
+
+- cumulative prequential bits/raw-byte,
+- tail bits/raw-byte over approximately 250 KB, 500 KB, 1 MB, 2 MB, and 4 MB.
+
+Tail windows are computed from the full per-update code accounting, not from sparsely logged telemetry; each requested window is moved only to the nearest real optimizer boundary.
 
 ## Layout
 
 ```text
 src/tokenizer_experiment/
   model.py          reusable Transformer
-  tunstall.py       BPE and Tunstall tokenizers
   unigram.py        byte-level Unigram LM tokenizer
-  sparse_prefix.py  sparse-prefix / Bunstall tokenizer
-  inspection.py     tokenizer structure diagnostics
+  tunstall.py       BPE + historical Tunstall tokenizer
+  sparse_prefix.py  historical sparse-prefix / Bunstall tokenizer
+  inspection.py     tokenizer diagnostics
   prequential.py    continuous-stream online prequential evaluation
-  experiment.py     reusable WikiText experiment orchestration
+  experiment.py     focused BPE/Unigram WikiText experiment
 
 scripts/
-  run_experiment.py      runnable CLI + W&B integration
-  inspect_tokenizers.py  inspect BPE/Tunstall tokens and branching
-  inspect_bunstall.py    inspect sparse-prefix tokenizer variants
+  run_experiment.py      runnable CLI + W&B integration + LR sweep
+  inspect_tokenizers.py  historical tokenizer inspection
+  inspect_bunstall.py    historical Bunstall inspection
 
 docs/experiments/
-  001-bpe-vs-tunstall-wikitext2.md       legacy block-prequential
-  002-sparse-prefix-bunstall.md           tokenizer-only structural experiment
-  003-legacy-block-prequential-bunstall.md
-  004-online-prequential-tokenizer-comparison.md
-  005-byte-unigram.md
+  001-005                 historical experiments
+  006-bpe-vs-byte-unigram-lr-sweep.md
 
 artifacts/               local generated outputs; gitignored
 
@@ -40,7 +46,7 @@ tests/
 
 The measured corpus is one continuous conditional sequence, not a collection of independent model samples. For WikiText we preserve the exact newline-joined raw text stream; row boundaries do not reset attention context.
 
-Each tokenizer tokenizes that entire stream **once**. Optimizer updates happen near fixed raw-byte milestones, moved only to positions that are token boundaries for every tokenizer. Those update positions decide when the compressor may learn; they do not retokenize the text or reset autoregressive context.
+Each tokenizer tokenizes that entire stream **once**. Optimizer updates happen near fixed raw-byte milestones, moved only to positions that are token boundaries for both tokenizers. Those update positions decide when the compressor may learn; they do not retokenize the text or reset autoregressive context.
 
 Conceptually:
 
@@ -60,55 +66,49 @@ The reserved special-token embedding is used only as BOS for the first token of 
 
 With context 256, large update segments are scored in subchunks of at most 128 new tokens. Each forward window therefore keeps as much preceding stream history as fits, and all subchunk gradients are accumulated before the single optimizer step for that raw segment.
 
-## Byte-Unigram hypothesis
-
-The newest tokenizer directly targets the quantity that most strongly tracked final model performance in Experiment 004: zero-context token codelength.
-
-`ByteUnigramTokenizer` uses Hugging Face Tokenizers' Unigram model/trainer over ByteLevel's reversible 256-symbol alphabet, with no Unicode normalization and no GPT-2 regex splitting. The trainer gets exactly 4081 real source pieces at the default shared model size; the 4082nd model class is reserved externally as BOS and never participates in source tokenization.
-
-The held-out diagnostic remains our own empirical metric, not the trainer's internal score:
-
-```text
-unigram bits/raw-byte = H(emitted token IDs) / mean raw bytes per token
-```
-
-So Byte-Unigram has to beat BPE on the same downstream zero-order criterion rather than grading itself on its training objective.
-
 ## Run
 
 ```bash
 uv sync --extra dev
-uv run python scripts/run_experiment.py
+uv run ruff check .
+uv run pytest -q
 ```
 
-Defaults:
-
-- target 256 raw bytes per optimizer update,
-- actual update positions shared by every tokenizer,
-- context 256 tokens,
-- one persistent model per tokenizer,
-- one pass over the continuous stream,
-- AdamW learning rate `1e-3`, weight decay `0.1`,
-- **Byte-Unigram runs first**, followed by the older experimental tokenizers and baselines.
-
-Useful options:
+Single-LR smoke test:
 
 ```bash
 HF_HUB_OFFLINE=1 uv run python scripts/run_experiment.py \
-  --wandb-mode offline \
-  --wandb-run-name byte-unigram
-
-# Fast smoke test. Tokenizer diagnostics print before the Transformer run.
-HF_HUB_OFFLINE=1 uv run python scripts/run_experiment.py \
   --max-preq-mb 0.05 \
   --wandb-mode disabled
-
-# Unigram trainer's maximum source-piece length (default 16 bytes).
-uv run python scripts/run_experiment.py --unigram-max-piece-length 24
-
-# Change learning cadence without changing model context.
-uv run python scripts/run_experiment.py --update-bytes 128
 ```
+
+Focused full LR sweep:
+
+```bash
+HF_HUB_OFFLINE=1 uv run python scripts/run_experiment.py \
+  --lrs 3e-4,1e-3,3e-3 \
+  --wandb-mode offline \
+  --wandb-run-name bpe-unigram-lr-sweep
+```
+
+Tokenizers are trained only once; each learning rate gets a fresh Transformer with the same seed and the exact same token stream/update boundaries.
+
+Defaults preserve the completed experiment where useful:
+
+- model vocabulary width 4082 (4081 source-token slots + one BOS class),
+- roughly first 2 MB of complete WikiText rows fit the tokenizers,
+- remaining ~8.95 MB is one continuous raw stream,
+- target 256 raw bytes per optimizer update,
+- context 256 tokens,
+- 4-layer, 256-wide Transformer,
+- AdamW weight decay 0.1,
+- seed 1337.
+
+## Byte-Unigram
+
+Byte-Unigram uses Hugging Face Tokenizers' Unigram model over ByteLevel's reversible 256-byte alphabet, with no Unicode normalization and no regex pretokenization. The trainer is asked for at most 4081 source pieces; if it underfills that target, unused model classes remain unreachable so the Transformer softmax width still exactly matches BPE.
+
+The reported `unigram_bits_per_byte` diagnostic is computed from the **empirical emitted token frequencies on the measured stream**, not from the Unigram trainer's internal probabilities.
 
 ## Crash-safe progress
 
@@ -118,39 +118,12 @@ Generated state lives under gitignored `artifacts/`:
 artifacts/
   results.partial.json   atomically rewritten during the run
   results.json           complete result after a clean finish
-  tokenizer-inspection.json
-  bunstall-inspection.json
   wandb/
 ```
 
-`results.partial.json` is rewritten every telemetry checkpoint (100 updates by default). If Python receives an interruption, the file is marked `interrupted` before exit when possible.
+`results.partial.json` is rewritten every telemetry checkpoint (100 updates by default). Every 1,000 optimizer updates, the current partial JSON is also logged as a versioned W&B progress artifact. A clean run logs the complete result.
 
-Every 1,000 optimizer updates, the current partial JSON is also logged as a new version of the W&B Artifact `prequential-progress`. A clean run logs `prequential-results` with the complete result. These checkpoint cadences are bookkeeping only and do not affect model training or codelength.
-
-The progress `mb` value is cumulative **raw UTF-8 megabytes encoded**, so every tokenizer should end at exactly the same MB value. Token counts differ by tokenizer.
-
-## Inspect the learned tokenizers
-
-Tokenizer-only inspections do not train the Transformer:
-
-```bash
-uv run python scripts/inspect_tokenizers.py
-uv run python scripts/inspect_bunstall.py --mode entropy
-uv run python scripts/inspect_bunstall.py --mode frequency
-```
-
-The BPE/Tunstall inspection logs the W&B Artifact `bpe-tunstall-inspection`. Bunstall inspections log `bunstall-entropy-inspection` or `bunstall-frequency-inspection`.
-
-Inspection output includes representative emitted tokens with visible whitespace, Tunstall fanouts, BPE continuation diagnostics, and Bunstall promoted-continuation statistics.
-
-## Default experiment
-
-- WikiText-2 raw.
-- Roughly the first 2 MB of complete rows fit the tokenizers and are shared side information.
-- The remaining ~8.95 MB is one continuous raw stream.
-- Requested vocabulary ~4096; the shared legal model vocabulary is 4082.
-- Same 4-layer, 256-wide Transformer for every tokenizer.
-- Byte-Unigram, Bunstall-frequency, Bunstall-entropy, BPE, then Tunstall-boundary run in that order by default.
+The progress `mb` value is cumulative **raw UTF-8 megabytes encoded**, so BPE and Byte-Unigram should end at exactly the same value.
 
 ## CI
 
