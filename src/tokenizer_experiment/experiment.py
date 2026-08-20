@@ -15,17 +15,17 @@ from datasets import load_dataset
 from .inspection import bytelevel_piece_bytes
 from .model import ModelConfig
 from .prequential import ProgressCallback, TrainConfig, run_stream_prequential
-from .sparse_prefix import SparsePrefixTokenizer
-from .tunstall import BPETokenizer, EmpiricalTunstallTokenizer
+from .tunstall import BPETokenizer
 from .unigram import ByteUnigramTokenizer
 
 
 @dataclass(frozen=True)
 class ExperimentConfig:
     dataset_config: str = "wikitext-2-raw-v1"
-    vocab_size: int = 4096
-    tunstall_mode: str = "boundary"
-    bunstall_modes: tuple[str, ...] = ("frequency", "entropy")
+    # Preserve the 4082-wide model used by the completed comparison. Without
+    # Tunstall there is no longer a structural requirement for this size, but
+    # keeping it fixed makes the focused BPE/Unigram follow-up directly comparable.
+    vocab_size: int = 4082
     unigram_max_piece_length: int = 16
     tokenizer_fit_mb: float = 2.0
     max_preq_mb: float = 0.0
@@ -36,7 +36,7 @@ class ExperimentConfig:
     heads: int = 4
     mlp_ratio: int = 4
     dropout: float = 0.0
-    lr: float = 1e-3
+    learning_rates: tuple[float, ...] = (1e-3,)
     weight_decay: float = 0.1
     seed: int = 1337
     log_every: int = 100
@@ -173,11 +173,17 @@ def run_experiment(
     device = torch.device(config.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but torch.cuda.is_available() is false")
+    if config.vocab_size < 257:
+        raise ValueError("vocab_size must leave room for 256 byte symbols plus BOS")
+    if not config.learning_rates or any(lr <= 0 for lr in config.learning_rates):
+        raise ValueError("learning_rates must contain positive values")
+    if len(set(config.learning_rates)) != len(config.learning_rates):
+        raise ValueError("learning_rates must be unique")
 
-    actual_vocab = EmpiricalTunstallTokenizer.legal_vocab_size(config.vocab_size)
+    actual_vocab = config.vocab_size
     print(
-        f"Requested vocab {config.vocab_size}; using exact shared model vocab {actual_vocab} "
-        f"(4081 source-token slots + one reserved BOS token at this size)"
+        f"Shared model vocab {actual_vocab} "
+        f"({actual_vocab - 1} source-token slots + one reserved BOS token)"
     )
     print(f"Loading Salesforce/wikitext / {config.dataset_config} ...")
     ds = load_dataset("Salesforce/wikitext", config.dataset_config, split="train")
@@ -194,30 +200,7 @@ def run_experiment(
     preq_raw = b"".join(preq_rows)
     print(
         f"tokenizer fit: {mb(len(fit_raw)):.2f} MB; "
-        f"candidate continuous stream: {mb(len(preq_raw)):.2f} MB"
-    )
-
-    print(f"\nTraining {config.tunstall_mode} Tunstall-style tokenizer ...")
-    t0 = time.perf_counter()
-    tunstall = EmpiricalTunstallTokenizer.train(
-        fit_raw, requested_vocab_size=actual_vocab, mode=config.tunstall_mode
-    )
-    tunstall.assert_prefix_free()
-    print(
-        f"Tunstall tokenizer built in {time.perf_counter() - t0:.1f}s; "
-        f"phrase leaves={tunstall.phrase_vocab_size}; "
-        f"max phrase={tunstall.max_phrase_bytes()} bytes"
-    )
-
-    # Only the end of the complete continuous stream needs to be a Tunstall
-    # phrase boundary. Optimizer/update boundaries are chosen later from token
-    # boundaries shared by every tokenizer.
-    encoded_end = tunstall.align_utf8_boundaries(preq_raw, [1.0])[0]
-    dropped_tail = len(preq_raw) - encoded_end
-    preq_raw = preq_raw[:encoded_end]
-    print(
-        f"continuous online stream: {mb(len(preq_raw)):.2f} MB; "
-        f"dropped trailing partial Tunstall phrase={dropped_tail} bytes"
+        f"continuous stream: {mb(len(preq_raw)):.2f} MB"
     )
 
     print("\nTraining byte-level Unigram LM tokenizer ...")
@@ -229,6 +212,7 @@ def run_experiment(
     )
     print(
         f"Byte-Unigram built in {time.perf_counter() - t0:.1f}s; "
+        f"source pieces={unigram.source_vocab_size}/{actual_vocab - 1}; "
         f"max phrase={unigram.max_phrase_bytes()} bytes"
     )
 
@@ -237,25 +221,9 @@ def run_experiment(
     bpe = BPETokenizer.train(fit_text, vocab_size=actual_vocab)
     print(f"BPE tokenizer built in {time.perf_counter() - t0:.1f}s")
 
-    bunstalls: dict[str, SparsePrefixTokenizer] = {}
-    for mode in config.bunstall_modes:
-        if mode not in {"entropy", "frequency"}:
-            raise ValueError(f"unknown Bunstall mode: {mode}")
-        print(f"\nTraining Bunstall-{mode} tokenizer ...")
-        t0 = time.perf_counter()
-        tokenizer = SparsePrefixTokenizer.train(fit_raw, actual_vocab, mode=mode)
-        bunstalls[mode] = tokenizer
-        print(
-            f"Bunstall-{mode} built in {time.perf_counter() - t0:.1f}s; "
-            f"max phrase={tokenizer.max_phrase_bytes()} bytes"
-        )
-
-    # Experimental/new tokenizers intentionally run first. Baselines come last.
     tokenizers: list[tuple[str, Any]] = [
         ("byte-unigram", unigram),
-        *[(f"bunstall-{mode}", bunstalls[mode]) for mode in config.bunstall_modes],
         ("bpe", bpe),
-        (f"tunstall-{config.tunstall_mode}", tunstall),
     ]
 
     print("\nTokenizing the continuous stream once per tokenizer ...")
@@ -296,19 +264,23 @@ def run_experiment(
         mlp_ratio=config.mlp_ratio,
         dropout=config.dropout,
     )
-    train_cfg = TrainConfig(
-        lr=config.lr,
-        weight_decay=config.weight_decay,
-        seed=config.seed,
-    )
 
-    results = []
-    for name, tokenizer in tokenizers:
-        ids, _offsets = streams[name]
-        print(f"\n{'=' * 72}\nCONTINUOUS PREQUENTIAL: {name}\n{'=' * 72}")
-        results.append(
-            run_stream_prequential(
-                name=name,
+    results: list[dict[str, Any]] = []
+    sweep = len(config.learning_rates) > 1
+    for lr in config.learning_rates:
+        train_cfg = TrainConfig(
+            lr=lr,
+            weight_decay=config.weight_decay,
+            seed=config.seed,
+        )
+        for name, tokenizer in tokenizers:
+            ids, _offsets = streams[name]
+            run_name = f"{name}@lr={lr:g}" if sweep else name
+            print(
+                f"\n{'=' * 72}\nCONTINUOUS PREQUENTIAL: {name}  lr={lr:g}\n{'=' * 72}"
+            )
+            result = run_stream_prequential(
+                name=run_name,
                 tokenizer=tokenizer,
                 ids=ids,
                 raw_boundaries=raw_boundaries,
@@ -319,31 +291,30 @@ def run_experiment(
                 log_every=config.log_every,
                 on_progress=on_progress,
             )
-        )
+            result["tokenizer"] = name
+            result["learning_rate"] = lr
+            results.append(result)
 
     metadata = {
         "protocol": (
             "continuous-stream online prequential: tokenize once; preserve autoregressive "
-            "context across row/update boundaries; score each raw segment before one update"
+            "context across update boundaries; score each raw segment before one update"
         ),
         "dataset": "Salesforce/wikitext",
         "dataset_config": config.dataset_config,
-        "requested_vocab_size": config.vocab_size,
         "actual_vocab_size": actual_vocab,
-        "tunstall_phrase_vocab_size": tunstall.phrase_vocab_size,
         "reserved_special_token": "used as BOS only at the start of the continuous stream",
-        "tunstall_mode": config.tunstall_mode,
-        "bunstall_modes": list(config.bunstall_modes),
+        "tokenizers": [name for name, _ in tokenizers],
         "unigram": {
             "implementation": "Hugging Face Tokenizers Unigram + ByteLevel",
+            "source_vocab_size": unigram.source_vocab_size,
             "max_piece_length": config.unigram_max_piece_length,
             "normalization": "none",
             "pretokenizer_regex": False,
         },
-        "evaluation_order": [name for name, _ in tokenizers],
+        "learning_rates": list(config.learning_rates),
         "tokenizer_fit_bytes": len(fit_raw),
         "prequential_bytes": len(preq_raw),
-        "dropped_tail_bytes": dropped_tail,
         "stream_policy": (
             "exact newline-joined WikiText byte stream; dataset rows do not reset model context"
         ),
@@ -353,9 +324,12 @@ def run_experiment(
         "update_bytes_min": int(update_sizes.min()),
         "update_bytes_max": int(update_sizes.max()),
         "model": asdict(model_cfg),
-        "training": asdict(train_cfg),
-        "optimizer_steps": len(raw_boundaries),
-        "passes_over_stream": 1,
+        "training": {
+            "weight_decay": config.weight_decay,
+            "seed": config.seed,
+        },
+        "optimizer_steps_per_run": len(raw_boundaries),
+        "passes_over_stream_per_run": 1,
         "log_every_updates": config.log_every,
         "device": str(device),
         "gpu": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
