@@ -6,7 +6,7 @@ from torch import nn
 
 from tokenizer_experiment.experiment import _shared_update_boundaries
 from tokenizer_experiment.model import CausalTransformer, ModelConfig
-from tokenizer_experiment.prequential import _stream_update_step
+from tokenizer_experiment.prequential import _stream_update_step, _tail_rates
 
 
 class RecordingBiasModel(nn.Module):
@@ -145,8 +145,23 @@ def test_shared_update_boundaries_follow_raw_milestones():
     assert _shared_update_boundaries(offsets, 250) == [256, 512, 768, 1000]
 
 
+def test_tail_rates_use_nearest_real_optimizer_boundary():
+    # Cumulative records correspond to stream start plus four update boundaries.
+    raw = [0, 100, 260, 510, 800]
+    bits = [0.0, 300.0, 620.0, 1020.0, 1455.0]
+
+    tail = _tail_rates(raw, bits, windows=(300, 500))
+
+    # For a requested 300-byte tail, target start=500 and boundary 510 is closest.
+    assert tail["300"]["actual_bytes"] == 290
+    assert tail["300"]["bits_per_byte"] == pytest.approx((1455 - 1020) / 290)
+    # For requested 500 bytes, target start=300 and boundary 260 is closest.
+    assert tail["500"]["actual_bytes"] == 540
+    assert tail["500"]["bits_per_byte"] == pytest.approx((1455 - 620) / 540)
+
+
 def test_transformer_uses_small_tied_embedding_initialization():
     model = CausalTransformer(vocab_size=257, cfg=ModelConfig(d_model=64, n_heads=4))
 
     assert model.head.weight.data_ptr() == model.token.weight.data_ptr()
-    assert float(model.token.weight.std()) == pytest.approx(0.02, abs=0.002)
+    assert model.token.weight.detach().std().item() == pytest.approx(0.02, abs=0.002)
