@@ -2,7 +2,7 @@
 
 Small controlled experiments comparing tokenizers by **continuous-stream online prequential codelength in bits per raw UTF-8 byte**.
 
-The experiments compare byte-level BPE, prefix-free Tunstall-style byte phrases, and sparse-prefix ("Bunstall") tokenizers using the same flat-softmax Transformer.
+The experiments compare byte-level BPE, byte-level Unigram LM, prefix-free Tunstall-style byte phrases, and sparse-prefix ("Bunstall") tokenizers using the same flat-softmax Transformer.
 
 > Earlier runs used either geometric block-prequential evaluation or persistent weights with the Transformer context reset at every dataset row. Those model results are legacy diagnostics, not the intended compressor-like prequential measurement.
 
@@ -12,6 +12,7 @@ The experiments compare byte-level BPE, prefix-free Tunstall-style byte phrases,
 src/tokenizer_experiment/
   model.py          reusable Transformer
   tunstall.py       BPE and Tunstall tokenizers
+  unigram.py        byte-level Unigram LM tokenizer
   sparse_prefix.py  sparse-prefix / Bunstall tokenizer
   inspection.py     tokenizer structure diagnostics
   prequential.py    continuous-stream online prequential evaluation
@@ -27,6 +28,7 @@ docs/experiments/
   002-sparse-prefix-bunstall.md           tokenizer-only structural experiment
   003-legacy-block-prequential-bunstall.md
   004-online-prequential-tokenizer-comparison.md
+  005-byte-unigram.md
 
 artifacts/               local generated outputs; gitignored
 
@@ -58,6 +60,20 @@ The reserved special-token embedding is used only as BOS for the first token of 
 
 With context 256, large update segments are scored in subchunks of at most 128 new tokens. Each forward window therefore keeps as much preceding stream history as fits, and all subchunk gradients are accumulated before the single optimizer step for that raw segment.
 
+## Byte-Unigram hypothesis
+
+The newest tokenizer directly targets the quantity that most strongly tracked final model performance in Experiment 004: zero-context token codelength.
+
+`ByteUnigramTokenizer` uses Hugging Face Tokenizers' Unigram model/trainer over ByteLevel's reversible 256-symbol alphabet, with no Unicode normalization and no GPT-2 regex splitting. The trainer gets exactly 4081 real source pieces at the default shared model size; the 4082nd model class is reserved externally as BOS and never participates in source tokenization.
+
+The held-out diagnostic remains our own empirical metric, not the trainer's internal score:
+
+```text
+unigram bits/raw-byte = H(emitted token IDs) / mean raw bytes per token
+```
+
+So Byte-Unigram has to beat BPE on the same downstream zero-order criterion rather than grading itself on its training objective.
+
 ## Run
 
 ```bash
@@ -73,14 +89,22 @@ Defaults:
 - one persistent model per tokenizer,
 - one pass over the continuous stream,
 - AdamW learning rate `1e-3`, weight decay `0.1`,
-- experimental tokenizers run before established baselines.
+- **Byte-Unigram runs first**, followed by the older experimental tokenizers and baselines.
 
 Useful options:
 
 ```bash
 HF_HUB_OFFLINE=1 uv run python scripts/run_experiment.py \
   --wandb-mode offline \
-  --wandb-run-name continuous-prequential-rerun
+  --wandb-run-name byte-unigram
+
+# Fast smoke test. Tokenizer diagnostics print before the Transformer run.
+HF_HUB_OFFLINE=1 uv run python scripts/run_experiment.py \
+  --max-preq-mb 0.05 \
+  --wandb-mode disabled
+
+# Unigram trainer's maximum source-piece length (default 16 bytes).
+uv run python scripts/run_experiment.py --unigram-max-piece-length 24
 
 # Change learning cadence without changing model context.
 uv run python scripts/run_experiment.py --update-bytes 128
@@ -126,7 +150,7 @@ Inspection output includes representative emitted tokens with visible whitespace
 - The remaining ~8.95 MB is one continuous raw stream.
 - Requested vocabulary ~4096; the shared legal model vocabulary is 4082.
 - Same 4-layer, 256-wide Transformer for every tokenizer.
-- Bunstall-frequency, Bunstall-entropy, BPE, then Tunstall-boundary run in that order by default.
+- Byte-Unigram, Bunstall-frequency, Bunstall-entropy, BPE, then Tunstall-boundary run in that order by default.
 
 ## CI
 
