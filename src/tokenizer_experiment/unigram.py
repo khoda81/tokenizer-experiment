@@ -32,24 +32,17 @@ def _bytelevel_piece_bytes(piece: str) -> bytes:
 class ByteUnigramTokenizer:
     """Byte-complete Unigram LM tokenizer using Hugging Face Tokenizers.
 
-    The tokenizer is trained on ByteLevel's reversible 256-symbol alphabet, so
-    every UTF-8 byte string remains representable without an unknown token.
-    Unlike BPE, vocabulary selection is driven by a unigram language-model
-    likelihood objective with EM/pruning.
-
-    One extra vocabulary entry is reserved as BOS for the Transformer. It never
-    appears in raw-stream tokenization.
+    The source tokenizer gets ``model_vocab_size - 1`` real byte pieces. The
+    final model class is reserved externally as BOS, so the Unigram trainer does
+    not spend a source-token slot on a special string and raw text can never
+    accidentally emit BOS.
     """
-
-    BOS_TOKEN = "<|bos|>"
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
-        self.vocab_size = tokenizer.get_vocab_size()
-        bos = tokenizer.token_to_id(self.BOS_TOKEN)
-        if bos is None:
-            raise RuntimeError("Unigram tokenizer has no reserved BOS token")
-        self.eos_id = bos  # historical model interface name; used as BOS only.
+        self.source_vocab_size = tokenizer.get_vocab_size()
+        self.eos_id = self.source_vocab_size  # historical interface name; BOS only.
+        self.vocab_size = self.source_vocab_size + 1
 
     @classmethod
     def train(
@@ -61,6 +54,8 @@ class ByteUnigramTokenizer:
         shrinking_factor: float = 0.75,
         n_sub_iterations: int = 2,
     ) -> ByteUnigramTokenizer:
+        if vocab_size < 257:
+            raise ValueError("vocab_size must leave room for 256 bytes plus BOS")
         if max_piece_length <= 0:
             raise ValueError("max_piece_length must be positive")
         if not 0.0 < shrinking_factor < 1.0:
@@ -70,6 +65,7 @@ class ByteUnigramTokenizer:
 
         from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
+        source_vocab_size = vocab_size - 1
         tokenizer = Tokenizer(models.Unigram())
         # No Unicode normalization: this experiment codes the exact UTF-8 bytes.
         # use_regex=False keeps the input as one byte-level stream instead of
@@ -79,9 +75,9 @@ class ByteUnigramTokenizer:
         )
         tokenizer.decoder = decoders.ByteLevel()
         trainer = trainers.UnigramTrainer(
-            vocab_size=vocab_size,
+            vocab_size=source_vocab_size,
             show_progress=True,
-            special_tokens=[cls.BOS_TOKEN],
+            special_tokens=[],
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
             shrinking_factor=shrinking_factor,
             unk_token=None,
@@ -99,8 +95,8 @@ class ByteUnigramTokenizer:
         wrapped = cls(tokenizer)
         if wrapped.vocab_size != vocab_size:
             raise RuntimeError(
-                f"Unigram trainer produced vocab={wrapped.vocab_size}, expected {vocab_size}. "
-                "Try a larger tokenizer-fit prefix or a smaller vocabulary."
+                f"Unigram trainer produced model vocab={wrapped.vocab_size}, "
+                f"expected {vocab_size}. Try a larger tokenizer-fit prefix or a smaller vocabulary."
             )
         return wrapped
 
@@ -129,6 +125,5 @@ class ByteUnigramTokenizer:
     def max_phrase_bytes(self) -> int:
         return max(
             len(self.token_piece(token_id))
-            for token_id in range(self.vocab_size)
-            if token_id != self.eos_id
+            for token_id in range(self.source_vocab_size)
         )
