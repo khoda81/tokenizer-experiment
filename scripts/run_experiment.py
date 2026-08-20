@@ -12,14 +12,16 @@ from tokenizer_experiment import ExperimentConfig, run_experiment
 ARTIFACTS_DIR = Path("artifacts")
 
 
-def parse_bunstall_modes(value: str) -> tuple[str, ...]:
-    modes = tuple(x.strip() for x in value.split(",") if x.strip())
-    invalid = set(modes) - {"entropy", "frequency"}
-    if invalid:
-        raise argparse.ArgumentTypeError(
-            f"unknown Bunstall modes: {', '.join(sorted(invalid))}"
-        )
-    return modes
+def parse_learning_rates(value: str) -> tuple[float, ...]:
+    try:
+        rates = tuple(float(x.strip()) for x in value.split(",") if x.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("learning rates must be numbers") from exc
+    if not rates or any(lr <= 0 for lr in rates):
+        raise argparse.ArgumentTypeError("learning rates must be positive")
+    if len(set(rates)) != len(rates):
+        raise argparse.ArgumentTypeError("learning rates must be unique")
+    return rates
 
 
 def atomic_write_json(path: Path, payload: object) -> None:
@@ -29,20 +31,25 @@ def atomic_write_json(path: Path, payload: object) -> None:
     tmp.replace(path)
 
 
+def _metric_key(model_name: str) -> str:
+    return (
+        model_name.replace("-", "_")
+        .replace("@", "_")
+        .replace("=", "_")
+        .replace(".", "p")
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Compare tokenizer families by continuous-stream prequential codelength."
+        description="Compare byte-level Unigram and BPE by continuous-stream prequential codelength."
     )
     p.add_argument("--dataset-config", default="wikitext-2-raw-v1")
-    p.add_argument("--vocab-size", type=int, default=4096)
     p.add_argument(
-        "--tunstall-mode", choices=["boundary", "empirical", "iid"], default="boundary"
-    )
-    p.add_argument(
-        "--bunstall-modes",
-        type=parse_bunstall_modes,
-        default=parse_bunstall_modes("frequency,entropy"),
-        help="Comma-separated Bunstall modes to include; empty string disables Bunstall.",
+        "--vocab-size",
+        type=int,
+        default=4082,
+        help="Shared Transformer vocabulary width; 4082 preserves the completed baseline.",
     )
     p.add_argument(
         "--unigram-max-piece-length",
@@ -58,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=256,
         help=(
             "Target raw bytes between optimizer updates. Actual updates move to the "
-            "nearest following raw-byte position that is a token boundary for every tokenizer."
+            "nearest following raw-byte position that is a token boundary for both tokenizers."
         ),
     )
     p.add_argument("--context", type=int, default=256)
@@ -71,7 +78,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--lr",
         type=float,
         default=1e-3,
-        help="AdamW learning rate; online default is deliberately aggressive.",
+        help="Single AdamW learning rate. Ignored when --lrs is supplied.",
+    )
+    p.add_argument(
+        "--lrs",
+        type=parse_learning_rates,
+        default=None,
+        help="Comma-separated LR sweep, e.g. 3e-4,1e-3,3e-3. Tokenizers are trained only once.",
     )
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=1337)
@@ -109,12 +122,13 @@ def main() -> None:
     args = build_parser().parse_args()
     if args.artifact_every <= 0:
         raise SystemExit("--artifact-every must be positive")
+    if args.lr <= 0:
+        raise SystemExit("--lr must be positive")
 
+    learning_rates = args.lrs if args.lrs is not None else (args.lr,)
     kwargs = {
         "dataset_config": args.dataset_config,
         "vocab_size": args.vocab_size,
-        "tunstall_mode": args.tunstall_mode,
-        "bunstall_modes": args.bunstall_modes,
         "unigram_max_piece_length": args.unigram_max_piece_length,
         "tokenizer_fit_mb": args.tokenizer_fit_mb,
         "max_preq_mb": args.max_preq_mb,
@@ -125,7 +139,7 @@ def main() -> None:
         "heads": args.heads,
         "mlp_ratio": args.mlp_ratio,
         "dropout": args.dropout,
-        "lr": args.lr,
+        "learning_rates": learning_rates,
         "weight_decay": args.weight_decay,
         "seed": args.seed,
         "log_every": args.log_every,
@@ -168,13 +182,7 @@ def main() -> None:
         dir=str(ARTIFACTS_DIR),
         config={**asdict(config), "artifact_every": args.artifact_every},
         save_code=True,
-        tags=[
-            "continuous-prequential",
-            "tokenization",
-            "byte-unigram",
-            config.tunstall_mode,
-            "bunstall",
-        ],
+        tags=["continuous-prequential", "byte-unigram", "bpe", "lr-sweep"],
     ) as run:
 
         def log_progress_artifact(model_name: str, update: int, status: str) -> None:
@@ -194,7 +202,7 @@ def main() -> None:
             run.log_artifact(artifact)
 
         def on_progress(model_name: str, point: dict) -> None:
-            key = model_name.replace("-", "_")
+            key = _metric_key(model_name)
             row = [
                 model_name,
                 point["update"],
@@ -260,13 +268,13 @@ def main() -> None:
         results_artifact = wandb.Artifact(
             name="prequential-results",
             type="experiment-results",
-            description="Continuous-stream online prequential tokenizer comparison results.",
+            description="Focused Byte-Unigram vs BPE prequential LR sweep.",
             metadata={
                 "protocol": "continuous-stream-online-prequential",
                 "dataset_config": config.dataset_config,
                 "vocab_size": payload["metadata"]["actual_vocab_size"],
                 "seed": config.seed,
-                "lr": config.lr,
+                "learning_rates": list(config.learning_rates),
                 "update_target_bytes": config.update_bytes,
             },
         )
@@ -295,21 +303,63 @@ def main() -> None:
             }
         )
 
-        bpe_result = next(result for result in payload["results"] if result["name"] == "bpe")
-        bpe_bpb = bpe_result["prequential_bits_per_byte"]
-        for result in payload["results"]:
-            name = result["name"].replace("-", "_")
-            bpb = result["prequential_bits_per_byte"]
-            run.summary[f"final/{name}_bits_per_byte"] = bpb
-            if result["name"] != "bpe":
-                run.summary[f"final/{name}_minus_bpe_bits_per_byte"] = bpb - bpe_bpb
+        for lr in config.learning_rates:
+            pair = {
+                result["tokenizer"]: result
+                for result in payload["results"]
+                if result["learning_rate"] == lr
+            }
+            bpe = pair["bpe"]
+            unigram = pair["byte-unigram"]
+            prefix = f"lr_{lr:g}".replace(".", "p")
+            run.summary[f"{prefix}/bpe_bits_per_byte"] = bpe[
+                "prequential_bits_per_byte"
+            ]
+            run.summary[f"{prefix}/byte_unigram_bits_per_byte"] = unigram[
+                "prequential_bits_per_byte"
+            ]
+            run.summary[f"{prefix}/byte_unigram_minus_bpe"] = (
+                unigram["prequential_bits_per_byte"] - bpe["prequential_bits_per_byte"]
+            )
+            for window in ("250000", "500000", "1000000", "2000000", "4000000"):
+                if window in bpe["tail"] and window in unigram["tail"]:
+                    run.summary[f"{prefix}/tail_{window}_bpe"] = bpe["tail"][window][
+                        "bits_per_byte"
+                    ]
+                    run.summary[f"{prefix}/tail_{window}_byte_unigram"] = unigram[
+                        "tail"
+                    ][window]["bits_per_byte"]
         run.summary["metadata"] = payload["metadata"]
 
     print("\nFINAL")
-    for result in payload["results"]:
-        bpb = result["prequential_bits_per_byte"]
-        suffix = "" if result["name"] == "bpe" else f"  ({bpb - bpe_bpb:+.6f} vs BPE)"
-        print(f"  {result['name']:20s} {bpb:.6f} bits/byte{suffix}")
+    for lr in config.learning_rates:
+        pair = {
+            result["tokenizer"]: result
+            for result in payload["results"]
+            if result["learning_rate"] == lr
+        }
+        unigram = pair["byte-unigram"]
+        bpe = pair["bpe"]
+        uni_bpb = unigram["prequential_bits_per_byte"]
+        bpe_bpb = bpe["prequential_bits_per_byte"]
+        print(f"\n  lr={lr:g}")
+        print(f"    byte-unigram  {uni_bpb:.6f} bits/byte")
+        print(f"    bpe           {bpe_bpb:.6f} bits/byte")
+        print(f"    delta         {uni_bpb - bpe_bpb:+.6f} bits/byte (Unigram - BPE)")
+        for window, label in (
+            ("1000000", "tail ~1 MB"),
+            ("500000", "tail ~500 KB"),
+            ("250000", "tail ~250 KB"),
+        ):
+            if window not in unigram["tail"] or window not in bpe["tail"]:
+                continue
+            uni_tail = unigram["tail"][window]
+            bpe_tail = bpe["tail"][window]
+            print(
+                f"    {label:12s}  unigram={uni_tail['bits_per_byte']:.6f}  "
+                f"bpe={bpe_tail['bits_per_byte']:.6f}  "
+                f"delta={uni_tail['bits_per_byte'] - bpe_tail['bits_per_byte']:+.6f}"
+            )
     print(f"\nWrote {output_path}; live checkpoint is {partial_path}")
 
 
